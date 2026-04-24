@@ -326,7 +326,7 @@ def _validate_partition_args(
 ) -> None:
     """Raise appropriate errors for invalid inputs."""
     if not nx.is_tree(T):
-        raise nx.NotATree("Input graph is not a tree.")
+        raise nx.NotATree("input graph is not a tree")
     n = len(T)
     if q < 1 or q > n:
         raise nx.NetworkXError(
@@ -440,10 +440,11 @@ def _feasible_minmax(
     Otherwise cut the edge (the child becomes a finished part with weight
     <= lam).
 
-    Children are processed in ascending residual-weight order.  This
-    simultaneously minimizes the number of cuts and minimizes the residual
-    passed up to the parent — the monotonicity property the outer binary
-    search needs.
+    Children are processed in ascending residual-weight order.  For the
+    additive weight functions shipped here (vertex, edge, and mixed sums)
+    this is the Kundu-Misra greedy: it yields the minimum number of cuts
+    at threshold lam and a residual that is monotone non-increasing in
+    lam, which is the property the outer binary search needs.
 
     Returns (ok, cut_edges, root_weight):
       ok          -- False iff some singleton weight > lam (infeasible).
@@ -521,32 +522,22 @@ def _add_cuts_to_reach_q(
 ) -> set[frozenset[Hashable]]:
     """Add arbitrary internal edges as cuts until exactly q parts.
 
+    Every tree edge is a bridge, so each non-cut edge added as a cut
+    increases the component count by exactly 1.  To reach q parts we
+    need q - 1 total cuts; pick any non-cut edges to fill the deficit.
+
     Safe for monotone W: splitting can only decrease the max component weight.
     """
-    comps = _components_from_cut_edges(T, cut_edges)
-    while len(comps) < q:
-        target = None
-        for comp in comps:
-            if len(comp) > 1:
-                target = comp
-                break
-        if target is None:
+    need = (q - 1) - len(cut_edges)
+    if need <= 0:
+        return cut_edges
+    for u, v in T.edges():
+        if need == 0:
             break
-        comp_set = set(target)
-        added = False
-        for u in target:
-            for v in T.neighbors(u):
-                if v in comp_set:
-                    key = frozenset((u, v))
-                    if key not in cut_edges:
-                        cut_edges.add(key)
-                        added = True
-                        break
-            if added:
-                break
-        if not added:
-            break
-        comps = _components_from_cut_edges(T, cut_edges)
+        key = frozenset((u, v))
+        if key not in cut_edges:
+            cut_edges.add(key)
+            need -= 1
     return cut_edges
 
 
@@ -634,7 +625,6 @@ def _binary_search_minmax(
         return [(frozenset(verts), value)]
 
     if q == n:
-        cuts = {frozenset(e) for e in T.edges()}
         comps = [[v] for v in verts]
         return [
             (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
@@ -715,7 +705,6 @@ def _binary_search_maxmin(
         return [(frozenset(verts), value)]
 
     if q == n:
-        cuts = {frozenset(e) for e in T.edges()}
         comps = [[v] for v in verts]
         return [
             (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
