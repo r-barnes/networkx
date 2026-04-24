@@ -81,6 +81,15 @@ Decomposition
 
    junction_tree
 
+Partitioning
+------------
+.. automodule:: networkx.algorithms.tree.partitioning
+.. autosummary::
+   :toctree: generated/
+
+   min_max_tree_partition
+   max_min_tree_partition
+
 Exceptions
 ----------
 .. automodule:: networkx.algorithms.tree.coding
