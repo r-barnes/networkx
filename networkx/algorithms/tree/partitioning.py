@@ -807,7 +807,7 @@ def min_max_tree_partition(
     *,
     weight_function: str = "vertex_weight_sum",
 ) -> list[tuple[frozenset, float]]:
-    """Partition a weighted tree into ``q`` components minimizing the maximum
+    r"""Partition a weighted tree into ``q`` components minimizing the maximum
     component weight.
 
     Removes ``q - 1`` edges from a tree ``T`` to produce ``q`` connected
@@ -875,13 +875,14 @@ def min_max_tree_partition(
     residual-weight order, cutting an edge whenever merging would exceed λ.
     The binary search converges in O(log(W/ε)) iterations, each costing
     O(n log n) for the sort, giving overall complexity
-    :math:`O(n \\log n \\cdot \\log(W / \\varepsilon))`.
+    :math:`O(n \log n \cdot \log(W / \varepsilon))`.
 
     References
     ----------
     .. [1] S. Kundu and J. Misra,
        "A linear tree partitioning algorithm",
        *SIAM Journal on Computing*, vol. 6, no. 1, pp. 151–154, 1977.
+       https://doi.org/10.1137/0206011
 
     See Also
     --------
@@ -921,7 +922,7 @@ def max_min_tree_partition(
     *,
     weight_function: str = "vertex_weight_sum",
 ) -> list[tuple[frozenset, float]]:
-    """Partition a weighted tree into ``q`` components maximizing the minimum
+    r"""Partition a weighted tree into ``q`` components maximizing the minimum
     component weight.
 
     Removes ``q - 1`` edges from a tree ``T`` to produce ``q`` connected
@@ -988,7 +989,7 @@ def max_min_tree_partition(
     λ, the oracle roots the tree and greedily cuts each child subtree whose
     accumulated weight reaches λ, creating a "heavy" component.  The binary
     search converges in O(log(W/ε)) iterations, each costing O(n), giving
-    overall complexity :math:`O(n \\log(W / \\varepsilon))`.
+    overall complexity :math:`O(n \log(W / \varepsilon))`.
 
     References
     ----------
@@ -1000,6 +1001,7 @@ def max_min_tree_partition(
     .. [2] S. Kundu and J. Misra,
        "A linear tree partitioning algorithm",
        *SIAM Journal on Computing*, vol. 6, no. 1, pp. 151–154, 1977.
+       https://doi.org/10.1137/0206011
 
     See Also
     --------
