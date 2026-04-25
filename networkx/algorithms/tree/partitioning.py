@@ -1,8 +1,13 @@
 """
 Algorithms for partitioning weighted trees into connected components.
 
-Supports MIN-MAX and MAX-MIN objectives over pluggable weight functions
-satisfying:
+Supports MIN-MAX and MAX-MIN objectives over four built-in additive weight
+functions, selected via the ``weight_function`` keyword:
+``"vertex_weight_sum"``, ``"edge_weight_sum"``, ``"mixed_sum"``, and
+``"vertex_count"``.
+
+Internally the algorithms are written against an abstract weight-function
+interface satisfying:
 
   (D) Decomposability: bounded state sigma(T') for each subtree T', with
       W(T') determined by sigma(T'), and sigma(T_parent ∪ T_child) computable
@@ -12,7 +17,9 @@ satisfying:
       (max-min) in post-order DFS yields the optimal number of parts.
 
 (D) + (G) hold for additive functions (sum of vertex weights, sum of edge
-lengths, vertex count, or any linear combination).
+lengths, vertex count, or any linear combination).  This interface is an
+internal extension point for maintainers adding new built-in weight
+functions; it is not part of the public API.
 
 Complexity
 ----------
@@ -28,7 +35,8 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import Any, Hashable
+from collections.abc import Hashable
+from typing import Any
 
 import networkx as nx
 
@@ -63,7 +71,9 @@ class WeightFunction(ABC):
         """Return the initial state for a single-vertex subtree."""
 
     @abstractmethod
-    def merge(self, parent_state: Any, child_state: Any, edge_data: dict[str, Any]) -> Any:
+    def merge(
+        self, parent_state: Any, child_state: Any, edge_data: dict[str, Any]
+    ) -> Any:
         """Return the merged state when joining a parent's subtree with a
         child's subtree across the edge described by *edge_data*."""
 
@@ -79,7 +89,9 @@ class WeightFunction(ABC):
         constraints (e.g. positive finite weights).
         """
 
-    def validate_edge(self, u: Hashable, v: Hashable, edge_data: dict[str, Any]) -> None:
+    def validate_edge(
+        self, u: Hashable, v: Hashable, edge_data: dict[str, Any]
+    ) -> None:
         """Raise `nx.NetworkXError` if *edge_data* is invalid for this weight
         function.  Called once per edge during input validation.
 
@@ -172,7 +184,9 @@ class EdgeWeightSum(WeightFunction):
     def weight(self, s: float) -> float:
         return s
 
-    def validate_edge(self, u: Hashable, v: Hashable, edge_data: dict[str, Any]) -> None:
+    def validate_edge(
+        self, u: Hashable, v: Hashable, edge_data: dict[str, Any]
+    ) -> None:
         w = edge_data.get(self._attr, self._default)
         if not math.isfinite(w):
             raise nx.NetworkXError(
@@ -181,8 +195,7 @@ class EdgeWeightSum(WeightFunction):
             )
         if w < 0:
             raise nx.NetworkXError(
-                f"Edge ({u!r}, {v!r}) has weight {w!r}; "
-                "all edge weights must be >= 0."
+                f"Edge ({u!r}, {v!r}) has weight {w!r}; all edge weights must be >= 0."
             )
 
 
@@ -226,15 +239,16 @@ class MixedSum(WeightFunction):
         w = node_data.get(self._nattr, self._ndef)
         if not math.isfinite(w):
             raise nx.NetworkXError(
-                f"Node {v!r} has non-finite weight {w!r}; "
-                "all weights must be finite."
+                f"Node {v!r} has non-finite weight {w!r}; all weights must be finite."
             )
         if w <= 0:
             raise nx.NetworkXError(
                 f"Node {v!r} has weight {w!r}; all node weights must be > 0."
             )
 
-    def validate_edge(self, u: Hashable, v: Hashable, edge_data: dict[str, Any]) -> None:
+    def validate_edge(
+        self, u: Hashable, v: Hashable, edge_data: dict[str, Any]
+    ) -> None:
         w = edge_data.get(self._eattr, self._edef)
         if not math.isfinite(w):
             raise nx.NetworkXError(
@@ -243,8 +257,7 @@ class MixedSum(WeightFunction):
             )
         if w < 0:
             raise nx.NetworkXError(
-                f"Edge ({u!r}, {v!r}) has weight {w!r}; "
-                "all edge weights must be >= 0."
+                f"Edge ({u!r}, {v!r}) has weight {w!r}; all edge weights must be >= 0."
             )
 
 
@@ -321,9 +334,7 @@ def _root_tree(
     return post_order, parent, edge_to_parent, children
 
 
-def _validate_partition_args(
-    T: nx.Graph, q: int, wf: WeightFunction
-) -> None:
+def _validate_partition_args(T: nx.Graph, q: int, wf: WeightFunction) -> None:
     """Raise appropriate errors for invalid inputs."""
     if not nx.is_tree(T):
         raise nx.NotATree("input graph is not a tree")
@@ -551,6 +562,13 @@ def _reduce_cuts_to_reach_q(
     with a neighbor.
 
     Uses union-find for O(n log n) performance instead of O(n^2) recomputation.
+    Sort keys are computed once from the initial component weights and are not
+    refreshed after merges.  This still preserves the max-min optimum because
+    the lightest cut is always adjacent to the at-most-one sub-threshold
+    component, which is absorbed into a heavy neighbor before any
+    heavy-only cuts are considered; every resulting component therefore
+    contains at least one heavy initial component (weight >= lambda*).  The
+    reduction is optimal-valued though not necessarily optimal-shaped.
     """
     comps = _components_from_cut_edges(T, cut_edges)
     if len(comps) <= q:
@@ -626,9 +644,7 @@ def _binary_search_minmax(
 
     if q == n:
         comps = [[v] for v in verts]
-        return [
-            (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
-        ]
+        return [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
 
     root = _root_at_leaf(T)
     post_order, _, edge_to_parent, children = _root_tree(T, root)
@@ -641,9 +657,7 @@ def _binary_search_minmax(
         # is optimal since every component weight is <= hi.
         cuts_ud = _add_cuts_to_reach_q(T, set(), q)
         comps = _components_from_cut_edges(T, cuts_ud)
-        return [
-            (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
-        ]
+        return [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
 
     # Check if lo itself is feasible.
     ok_lo, cuts_lo, _ = _feasible_minmax(
@@ -652,9 +666,7 @@ def _binary_search_minmax(
     if ok_lo and len(cuts_lo) + 1 <= q:
         cuts_ud = _add_cuts_to_reach_q(T, set(cuts_lo), q)
         comps = _components_from_cut_edges(T, cuts_ud)
-        return [
-            (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
-        ]
+        return [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
 
     # Binary search for smallest feasible lambda in (lo, hi].
     lo_b, hi_b = lo, hi
@@ -684,9 +696,7 @@ def _binary_search_minmax(
 
     cuts_ud = _add_cuts_to_reach_q(T, set(best_cuts), q)
     comps = _components_from_cut_edges(T, cuts_ud)
-    return [
-        (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
-    ]
+    return [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
 
 
 def _binary_search_maxmin(
@@ -706,9 +716,7 @@ def _binary_search_maxmin(
 
     if q == n:
         comps = [[v] for v in verts]
-        return [
-            (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
-        ]
+        return [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
 
     root = _root_at_leaf(T)
     post_order, _, edge_to_parent, children = _root_tree(T, root)
@@ -743,15 +751,11 @@ def _binary_search_maxmin(
         # heavy parts; produce q arbitrary components.
         cuts_ud = _add_cuts_to_reach_q(T, set(), q)
         comps = _components_from_cut_edges(T, cuts_ud)
-        return [
-            (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
-        ]
+        return [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
 
     cuts_ud = _reduce_cuts_to_reach_q(T, set(best_cuts), q, wf)
     comps = _components_from_cut_edges(T, cuts_ud)
-    return [
-        (frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps
-    ]
+    return [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +802,10 @@ def _resolve_weight_function(
 
 @nx.utils.not_implemented_for("directed")
 @nx.utils.not_implemented_for("multigraph")
+# node_attrs/edge_attrs are over-declared for weight_function="vertex_count"
+# (which reads neither attribute); the dispatcher will pass attribute data
+# through unused, which is benign and matches NetworkX convention for
+# optional-attribute dispatch.
 @nx._dispatchable(node_attrs="node_weight", edge_attrs="edge_weight")
 def min_max_tree_partition(
     T: nx.Graph,
@@ -913,6 +921,8 @@ def min_max_tree_partition(
 
 @nx.utils.not_implemented_for("directed")
 @nx.utils.not_implemented_for("multigraph")
+# See min_max_tree_partition: node_attrs/edge_attrs are deliberately
+# over-declared for the vertex_count weight function.
 @nx._dispatchable(node_attrs="node_weight", edge_attrs="edge_weight")
 def max_min_tree_partition(
     T: nx.Graph,
