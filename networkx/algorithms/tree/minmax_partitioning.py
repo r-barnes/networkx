@@ -3,8 +3,9 @@ Min-max and max-min tree partitioning algorithms.
 
 Implements ``min_max_tree_partition`` (Kundu-Misra 1977) and
 ``max_min_tree_partition`` (Perl-Schach 1981): given a weighted tree and an
-integer q, partition it into exactly q connected subtrees minimizing the
-heaviest component (min-max) or maximizing the lightest component (max-min).
+integer `q`, partition it into exactly `q` connected
+subtrees minimizing the heaviest component (min-max) or maximizing the lightest
+component (max-min).
 
 Both algorithms support the same four built-in additive weight functions,
 selected via the ``weight_function`` keyword:
@@ -436,8 +437,8 @@ def _trivial_partition(
     node_w: dict[Hashable, int | float],
     edge_w: dict[tuple[Hashable, Hashable], int | float],
 ) -> list[tuple[frozenset[Hashable], int | float]] | None:
-    """The q == 1 (whole tree) and q == n (all singletons) partitions,
-    common to both solvers; None when 1 < q < n."""
+    """The q == 1 (whole tree) and q == n (all singletons)
+    partitions, common to both solvers; None when 1 < q < n."""
     verts = list(T)
     if q == 1:
         return [(frozenset(verts), _component_weight(T, verts, node_w, edge_w))]
@@ -449,11 +450,11 @@ def _trivial_partition(
 def _add_cuts_to_reach_q(
     T: nx.Graph, cut_edges: set[frozenset[Hashable]], q: int
 ) -> set[frozenset[Hashable]]:
-    """Add arbitrary internal edges as cuts until exactly q parts.
+    """Add arbitrary internal edges as cuts until exactly `q` parts.
 
     Every tree edge is a bridge, so each non-cut edge added as a cut
-    increases the component count by exactly 1.  To reach q parts we
-    need q - 1 total cuts; pick any non-cut edges to fill the deficit.
+    increases the component count by exactly 1.  To reach `q` parts we
+    need `q - 1` total cuts; pick any non-cut edges to fill the deficit.
 
     Safe for monotone W: splitting can only decrease the max component weight.
     """
@@ -477,8 +478,8 @@ def _reduce_to_q_parts(
     node_w: dict[Hashable, int | float],
     edge_w: dict[tuple[Hashable, Hashable], int | float],
 ) -> list[tuple[frozenset[Hashable], int | float]]:
-    """Reduce parts to exactly q for max-min by merging the lightest component
-    with a neighbor, returning the final partition as (nodes, weight) pairs.
+    """Reduce parts to exactly `q` for max-min by merging the lightest
+    component with a neighbor, returning the final partition as (nodes, weight) pairs.
 
     Uses ``nx.utils.UnionFind`` over component indices; vertices are
     regrouped in a single pass at the end.  Sort keys are computed once
@@ -656,7 +657,7 @@ def _binary_search_minmax(
     edge_w: dict[tuple[Hashable, Hashable], int | float],
     integral: bool,
 ) -> list[tuple[frozenset[Hashable], int | float]]:
-    """Min-max q-partition via exact grid bisection + greedy oracle.
+    """Partition into `q` parts via exact grid bisection + greedy oracle.
 
     Bisects the grid of representable threshold values (see
     `_bisect_threshold` for the seeding and candidate-verification
@@ -696,11 +697,11 @@ def _binary_search_minmax(
     # (otherwise), so every achieved sum is already on the bisection grid.
     _, best_cuts, hi = probe(math.inf)
 
-    # Seed near total/q: with node-additive weights some part must weigh at
-    # least total/q (pigeonhole); with edge weights, cut edges leave the
-    # total, so it is only a heuristic starting probe.  Correctness is
-    # unaffected either way — every probe verifies which side of the
-    # optimum it lands on.
+    # Seed near total/q: with node-additive weights some part
+    # must weigh at least total/q (pigeonhole); with edge
+    # weights, cut edges leave the total, so it is only a heuristic starting
+    # probe.  Correctness is unaffected either way — every probe verifies
+    # which side of the optimum it lands on.
     guess = -(-hi // q) if integral else hi / q
     best_cuts = _bisect_threshold(
         probe, lo, hi, best_cuts, guess, minimize=True, integral=integral
@@ -715,7 +716,7 @@ def _binary_search_maxmin(
     edge_w: dict[tuple[Hashable, Hashable], int | float],
     integral: bool,
 ) -> list[tuple[frozenset[Hashable], int | float]]:
-    """Max-min q-partition via exact grid bisection + greedy oracle.
+    """Partition into `q` parts via exact grid bisection + greedy oracle.
 
     Mirror image of `_binary_search_minmax`, sharing `_bisect_threshold`:
     the feasible lower bound snaps up to the lightest heavy part achieved
@@ -734,19 +735,21 @@ def _binary_search_maxmin(
         return heavy_count >= q, cuts, min_heavy, root_w
 
     # lam = 0 cuts every edge (all weights are nonnegative), so it is
-    # feasible whenever q <= n; the lightest part it actually produced is
-    # the feasible lower bound.  All weights are ints (integral mode) or
-    # floats (otherwise), so every achieved sum is already on the grid.
+    # feasible whenever q <= n; the lightest part it actually
+    # produced is the feasible lower bound.  All weights are ints (integral
+    # mode) or floats (otherwise), so every achieved sum is already on the
+    # grid.
     _, best_cuts, lo, _ = probe(0)
 
-    # No q >= 2 disjoint parts can each weigh as much as the whole tree
-    # (unless the total is zero, in which case lo == hi already), so the
-    # whole-tree weight — the unbounded probe's residual — is an infeasible
-    # upper bound.
+    # No q >= 2 disjoint parts can each weigh as much as the
+    # whole tree (unless the total is zero, in which case lo == hi already),
+    # so the whole-tree weight — the unbounded probe's residual — is an
+    # infeasible upper bound.
     _, _, _, hi = probe(math.inf)
 
-    # Pigeonhole seed: the lightest part can weigh at most total/q (part
-    # weights sum to at most the whole-tree weight in every weight mode).
+    # Pigeonhole seed: the lightest part can weigh at most
+    # total/q (part weights sum to at most the whole-tree
+    # weight in every weight mode).
     guess = hi // q if integral else hi / q
     best_cuts = _bisect_threshold(
         lambda lam: probe(lam)[:3],
@@ -844,12 +847,12 @@ def min_max_tree_partition(
     *,
     weight_function: str = "vertex_weight_sum",
 ) -> list[frozenset[Hashable]]:
-    r"""Partition a weighted tree into ``q`` components minimizing the maximum
-    component weight.
+    r"""Partition a weighted tree into ``q`` components minimizing
+    the maximum component weight.
 
-    Removes ``q - 1`` edges from a tree ``T`` to produce ``q`` connected
-    subtrees (components) such that the weight of the heaviest component
-    is as small as possible.
+    Removes ``q - 1`` edges from a tree ``T`` to produce
+    ``q`` connected subtrees (components) such that the weight
+    of the heaviest component is as small as possible.
 
     By default, component weight is the sum of vertex weights, read from
     the node attribute ``weight`` (nodes missing the attribute are assigned
@@ -888,10 +891,10 @@ def min_max_tree_partition(
     Returns
     -------
     partition : list of frozenset
-        A list of ``q`` frozensets, each holding the node labels of one
-        component.  The list is sorted in **descending** order of component
-        weight (heaviest component first), because the heaviest component
-        is the quantity being minimized.
+        A list of ``q`` frozensets, each holding the node
+        labels of one component.  The list is sorted in **descending** order
+        of component weight (heaviest component first), because the heaviest
+        component is the quantity being minimized.
 
     Raises
     ------
@@ -899,8 +902,9 @@ def min_max_tree_partition(
         If ``T`` is directed or a multigraph.
 
     NetworkXError
-        If ``q`` is not an integer, ``q`` is not in ``[1, len(T)]``,
-        ``weight_function`` is unrecognised, ``node_weight`` or
+        If ``q`` is not an integer, ``q`` is
+        not in ``[1, len(T)]``, ``weight_function`` is unrecognised,
+        ``node_weight`` or
         ``edge_weight`` is not a string, a node or edge weight is invalid
         for the selected weight function (non-numeric, non-finite, or out
         of range), or float weights are mixed with integer weights that
@@ -995,12 +999,12 @@ def max_min_tree_partition(
     *,
     weight_function: str = "vertex_weight_sum",
 ) -> list[frozenset[Hashable]]:
-    r"""Partition a weighted tree into ``q`` components maximizing the minimum
-    component weight.
+    r"""Partition a weighted tree into ``q`` components maximizing
+    the minimum component weight.
 
-    Removes ``q - 1`` edges from a tree ``T`` to produce ``q`` connected
-    subtrees (components) such that the weight of the lightest component
-    is as large as possible.
+    Removes ``q - 1`` edges from a tree ``T`` to produce
+    ``q`` connected subtrees (components) such that the weight
+    of the lightest component is as large as possible.
 
     By default, component weight is the sum of vertex weights, read from
     the node attribute ``weight`` (nodes missing the attribute are assigned
@@ -1039,10 +1043,10 @@ def max_min_tree_partition(
     Returns
     -------
     partition : list of frozenset
-        A list of ``q`` frozensets, each holding the node labels of one
-        component.  The list is sorted in **ascending** order of component
-        weight (lightest component first), because the lightest component
-        is the quantity being maximized.
+        A list of ``q`` frozensets, each holding the node
+        labels of one component.  The list is sorted in **ascending** order
+        of component weight (lightest component first), because the lightest
+        component is the quantity being maximized.
 
     Raises
     ------
@@ -1050,8 +1054,9 @@ def max_min_tree_partition(
         If ``T`` is directed or a multigraph.
 
     NetworkXError
-        If ``q`` is not an integer, ``q`` is not in ``[1, len(T)]``,
-        ``weight_function`` is unrecognised, ``node_weight`` or
+        If ``q`` is not an integer, ``q`` is
+        not in ``[1, len(T)]``, ``weight_function`` is unrecognised,
+        ``node_weight`` or
         ``edge_weight`` is not a string, a node or edge weight is invalid
         for the selected weight function (non-numeric, non-finite, or out
         of range), or float weights are mixed with integer weights that
