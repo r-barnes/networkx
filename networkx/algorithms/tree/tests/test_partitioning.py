@@ -20,16 +20,14 @@ from __future__ import annotations
 
 import math
 import random
+import warnings
 from itertools import combinations
 
 import pytest
 
 import networkx as nx
 from networkx.algorithms.tree.partitioning import (
-    _component_weight,
-    _components_from_cut_edges,
     _resolve_weight_function,
-    _weight_maps,
     _WeightSpec,
     max_min_tree_partition,
     min_max_tree_partition,
@@ -42,9 +40,26 @@ def _wf(name: str, node_attr: str = "weight", edge_attr: str = "weight") -> _Wei
 
 
 def _component_weight_via_wf(T: nx.Graph, comp, wf: _WeightSpec) -> float:
-    """Component weight computed through a weight-function spec."""
-    node_w, edge_w = _weight_maps(T, wf)
-    return _component_weight(T, list(comp), node_w, edge_w)
+    """Component weight recomputed independently of the module under test.
+
+    Reads attributes straight off the graph (missing attributes default
+    to 1, per the documented contract) so that a bug in the module's own
+    weight bookkeeping cannot cancel out in oracle comparisons.  Sums run
+    in graph iteration order, so identical components always sum in the
+    same order regardless of how *comp* is ordered.
+    """
+    comp = set(comp)
+    if wf.node_attr is None:
+        total = wf.node_const * len(comp)
+    else:
+        total = sum(T.nodes[v].get(wf.node_attr, 1) for v in T if v in comp)
+    if wf.edge_attr is not None:
+        total += sum(
+            d.get(wf.edge_attr, 1)
+            for u, v, d in T.edges(data=True)
+            if u in comp and v in comp
+        )
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +80,7 @@ def _attach_weights(
     weight_function: str,
 ) -> list[tuple[frozenset, float]]:
     wf = _resolve_weight_function(weight_function, node_weight, edge_weight)
-    node_w, edge_w = _weight_maps(T, wf)
-    return [
-        (nodes, _component_weight(T, list(nodes), node_w, edge_w)) for nodes in parts
-    ]
+    return [(nodes, _component_weight_via_wf(T, nodes, wf)) for nodes in parts]
 
 
 def _minmax(
@@ -125,27 +137,25 @@ def _brute_force_partition(
     maximizes the minimum component weight (``maximize_min=True``).  Used
     here as an independent oracle for cross-checking the binary-search
     solvers on small inputs (n <= 12); O(C(n-1, q-1)) — do not use in
-    production.
+    production.  Deliberately built from networkx primitives and the
+    independent weight recompute above, not the module under test's
+    helpers, so shared bugs cannot cancel out.
     """
     k = q - 1
     edges = list(T.edges())
-    node_w, edge_w = _weight_maps(T, wf)
 
     if k == 0:
-        value = _component_weight(T, list(T), node_w, edge_w)
-        return [(frozenset(T.nodes()), value)]
+        return [(frozenset(T.nodes()), _component_weight_via_wf(T, T.nodes(), wf))]
 
     best_val = float("inf") if not maximize_min else float("-inf")
     best_partition = []
 
     for cut_indices in combinations(range(len(edges)), k):
-        cut_set = {frozenset((edges[i][0], edges[i][1])) for i in cut_indices}
-        comps = _components_from_cut_edges(T, cut_set)
+        cut = [edges[i] for i in cut_indices]
+        comps = list(nx.connected_components(nx.restricted_view(T, [], cut)))
         if len(comps) != q:
             continue
-        labeled = [
-            (frozenset(c), _component_weight(T, c, node_w, edge_w)) for c in comps
-        ]
+        labeled = [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
         val = (
             max(w for _, w in labeled)
             if not maximize_min
@@ -432,6 +442,18 @@ class TestValidation:
         assert min_max_tree_partition.graphs == {"T": 0}
         assert max_min_tree_partition.graphs == {"T": 0}
 
+    def test_dispatchable_declares_missing_attr_default_1(self):
+        """The implementation defaults missing node/edge weight attributes
+        to 1.  String-form node_attrs resolves to a default of None in the
+        dispatch machinery (unlike edge_attrs, which resolves to 1), so the
+        dict form with an explicit default is required for native backends
+        to reproduce the reference behavior on graphs with missing
+        attributes."""
+        assert min_max_tree_partition.node_attrs == {"node_weight": 1}
+        assert max_min_tree_partition.node_attrs == {"node_weight": 1}
+        assert min_max_tree_partition.edge_attrs == {"edge_weight": 1}
+        assert max_min_tree_partition.edge_attrs == {"edge_weight": 1}
+
     def test_graph_passable_by_keyword(self):
         G = nx.path_graph(4)
         assert len(min_max_tree_partition(T=G, q=2)) == 2
@@ -477,6 +499,29 @@ class TestValidation:
         with pytest.raises(nx.NetworkXError, match="integer"):
             _maxmin(G, bad_q)
 
+    @pytest.mark.parametrize("bad_q", [True, False])
+    def test_bool_q_raises(self, bad_q):
+        """bool passes isinstance(q, Integral); pre-fix q=True silently
+        returned the trivial 1-part partition."""
+        G = nx.path_graph(5)
+        with pytest.raises(nx.NetworkXError, match="integer"):
+            _minmax(G, bad_q)
+        with pytest.raises(nx.NetworkXError, match="integer"):
+            _maxmin(G, bad_q)
+
+    @pytest.mark.parametrize("fn", [min_max_tree_partition, max_min_tree_partition])
+    @pytest.mark.parametrize("kwarg", ["node_weight", "edge_weight"])
+    def test_non_string_weight_param_raises(self, fn, kwarg):
+        """Pre-fix, node_weight=None silently degraded vertex_weight_sum to
+        vertex_count (None became the attribute name, matching no attribute,
+        and validation was skipped), returning a weight-blind partition."""
+        G = nx.path_graph(4)
+        G.nodes[0]["weight"] = 100
+        with pytest.raises(nx.NetworkXError, match="must be a string"):
+            fn(G, 2, **{kwarg: None})
+        with pytest.raises(nx.NetworkXError, match="must be a string"):
+            fn(G, 2, **{kwarg: 5})
+
     @pytest.mark.parametrize("bad_weight", [-1, -0.5, 0])
     def test_negative_weight_raises(self, bad_weight):
         G = nx.path_graph(4)
@@ -521,16 +566,61 @@ class TestValidation:
         with pytest.raises(nx.NetworkXError, match="non-numeric"):
             _minmax(G, 2)
 
+    @pytest.mark.parametrize("bad_weight", ["3", "1e3", True])
+    def test_numeric_looking_node_weight_raises(self, bad_weight):
+        """Pre-fix, numeric strings passed validation via float(w) and were
+        silently used as weights instead of raising the documented error;
+        bools are near-certain bugs and are likewise rejected."""
+        G = nx.path_graph(4)
+        G.nodes[1]["weight"] = bad_weight
+        with pytest.raises(nx.NetworkXError, match="non-numeric"):
+            _minmax(G, 2)
+        with pytest.raises(nx.NetworkXError, match="non-numeric"):
+            _maxmin(G, 2)
+
+    @pytest.mark.parametrize("bad_weight", ["2", True])
+    def test_numeric_looking_edge_weight_raises(self, bad_weight):
+        G = nx.path_graph(4)
+        G.edges[1, 2]["weight"] = bad_weight
+        with pytest.raises(nx.NetworkXError, match="non-numeric"):
+            _minmax(G, 2, weight_function="edge_weight_sum")
+        with pytest.raises(nx.NetworkXError, match="non-numeric"):
+            _maxmin(G, 2, weight_function="edge_weight_sum")
+
     def test_mixed_huge_int_and_float_weights_raise(self):
         """Integers beyond float range are exact in all-integer trees, but
         cannot be summed with float weights; that mix raises clearly
         instead of leaking an OverflowError."""
         G = nx.path_graph(3)
         nx.set_node_attributes(G, {0: 10**400, 1: 1.5, 2: 1.5}, "weight")
-        with pytest.raises(nx.NetworkXError, match="float range"):
+        with pytest.raises(nx.NetworkXError, match="exactly representable"):
             _minmax(G, 2)
-        with pytest.raises(nx.NetworkXError, match="float range"):
+        with pytest.raises(nx.NetworkXError, match="exactly representable"):
             _maxmin(G, 2)
+
+    def test_mixed_float_and_inexact_int_weights_raise(self):
+        """Integers above 2**53 that are not exact doubles fall off the
+        float bisection grid.  Pre-fix this mix silently returned a
+        partition that was suboptimal under the documented
+        floating-point-summation objective (probe thresholds could not
+        separate candidates within one float gap)."""
+        G = nx.Graph([(0, 1), (0, 2)])
+        nx.set_node_attributes(G, {0: 4.0, 1: 2**60 + 4, 2: 2**60 + 1}, "weight")
+        with pytest.raises(nx.NetworkXError, match="exactly representable"):
+            _minmax(G, 2)
+        with pytest.raises(nx.NetworkXError, match="exactly representable"):
+            _maxmin(G, 2)
+
+    def test_mixed_float_and_exact_representable_int_ok(self):
+        """Large integers that ARE exact doubles (e.g. 2**60) mix fine with
+        floats: everything lands on the float grid, so the documented
+        float-summation exactness holds."""
+        G = nx.Graph([(0, 1), (0, 2)])
+        nx.set_node_attributes(G, {0: 4.0, 1: 2**60, 2: 2**60}, "weight")
+        for fn in [min_max_tree_partition, max_min_tree_partition]:
+            parts = fn(G, 2)
+            assert len(parts) == 2
+            assert set().union(*parts) == set(G.nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -2012,3 +2102,110 @@ class TestReviewRegressions:
         assert _is_valid_partition(
             G, p, 3, wf=_wf("mixed_sum", node_attr="size", edge_attr="len")
         )
+
+
+# ---------------------------------------------------------------------------
+# numpy weights
+# ---------------------------------------------------------------------------
+
+
+class TestNumpyWeights:
+    """numpy scalar weights must behave like their Python counterparts.
+
+    numpy fixed-width integers pass isinstance(w, numbers.Integral); pre-fix
+    they skipped coercion and silently wrapped at 64 bits during probe and
+    grid arithmetic, returning a wrong partition with only a RuntimeWarning.
+    """
+
+    def test_numpy_int_weights_are_exact_minmax(self):
+        np = pytest.importorskip("numpy")
+        G = nx.path_graph(4)
+        for v, w in enumerate([2**61, 2**61, 2**62, 2**61]):
+            G.nodes[v]["weight"] = np.int64(w)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            parts = min_max_tree_partition(G, 2)
+        # Optimal cut is (1, 2): max part weight 3 * 2**61 beats 2**63.
+        assert set(parts) == {frozenset({0, 1}), frozenset({2, 3})}
+
+    def test_numpy_int_weights_are_exact_maxmin(self):
+        np = pytest.importorskip("numpy")
+        G = nx.path_graph(4)
+        for v, w in enumerate([2**61, 2**61, 2**62, 2**61]):
+            G.nodes[v]["weight"] = np.int64(w)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            parts = max_min_tree_partition(G, 2)
+        # Optimal cut is (1, 2): min part weight 2**62 beats 2**61.
+        assert set(parts) == {frozenset({0, 1}), frozenset({2, 3})}
+
+    def test_numpy_float_weights(self):
+        np = pytest.importorskip("numpy")
+        G = nx.path_graph(4)
+        for v, w in enumerate([3.0, 1.0, 1.0, 3.0]):
+            G.nodes[v]["weight"] = np.float64(w)
+        parts = min_max_tree_partition(G, 2)
+        assert set(parts) == {frozenset({0, 1}), frozenset({2, 3})}
+
+
+# ---------------------------------------------------------------------------
+# Missing edge attributes default to 1
+# ---------------------------------------------------------------------------
+
+
+class TestMissingEdgeAttrDefault:
+    """Edges missing the weight attribute default to 1 (documented).
+
+    These trees are built so the optimal SHAPE depends on the default: with
+    a wrong default (e.g. 0) the returned partition itself changes, so the
+    tests cannot be fooled by weight bookkeeping that is consistently wrong
+    on both sides of a comparison.  On the 6-path with explicit weight 1 on
+    edges (0,1), (1,2), (4,5) and edges (2,3), (3,4) missing, cutting (2,3)
+    is the unique optimum for both objectives under default 1 (cut values
+    4/3/2/3/4 for min-max, 0/1/2/1/0 for max-min), while default 0 would
+    move the min-max optimum to cutting (1,2).
+    """
+
+    @pytest.mark.parametrize("weight_function", ["edge_weight_sum", "mixed_sum"])
+    def test_path_missing_edge_attrs_minmax(self, weight_function):
+        G = nx.path_graph(6)
+        G.edges[0, 1]["weight"] = 1
+        G.edges[1, 2]["weight"] = 1
+        G.edges[4, 5]["weight"] = 1
+        parts = min_max_tree_partition(G, 2, weight_function=weight_function)
+        assert set(parts) == {frozenset({0, 1, 2}), frozenset({3, 4, 5})}
+
+    @pytest.mark.parametrize("weight_function", ["edge_weight_sum", "mixed_sum"])
+    def test_path_missing_edge_attrs_maxmin(self, weight_function):
+        G = nx.path_graph(6)
+        G.edges[0, 1]["weight"] = 1
+        G.edges[1, 2]["weight"] = 1
+        G.edges[4, 5]["weight"] = 1
+        parts = max_min_tree_partition(G, 2, weight_function=weight_function)
+        assert set(parts) == {frozenset({0, 1, 2}), frozenset({3, 4, 5})}
+
+    @pytest.mark.parametrize("weight_function", ["edge_weight_sum", "mixed_sum"])
+    @pytest.mark.parametrize("seed", range(4))
+    def test_random_trees_missing_edge_attrs(self, seed, weight_function):
+        """Randomized sweep against the independent brute-force oracle with
+        roughly half the edge (and node) attributes missing."""
+        rng = random.Random(seed)
+        T = nx.random_labeled_tree(8, seed=seed)
+        for v in T.nodes:
+            if rng.random() < 0.5:
+                T.nodes[v]["weight"] = rng.randint(1, 9)
+        for u, v in T.edges:
+            if rng.random() < 0.5:
+                T.edges[u, v]["weight"] = rng.randint(1, 9)
+        q = rng.randint(2, 5)
+        wf = _wf(weight_function)
+
+        p_mm = _minmax(T, q, weight_function=weight_function)
+        bf_mm = _brute_force_partition(T, q, wf, maximize_min=False)
+        assert _is_valid_partition(T, p_mm, q, wf=wf)
+        assert _max_weight(p_mm) == _max_weight(bf_mm)
+
+        p_mx = _maxmin(T, q, weight_function=weight_function)
+        bf_mx = _brute_force_partition(T, q, wf, maximize_min=True)
+        assert _is_valid_partition(T, p_mx, q, wf=wf)
+        assert _min_weight(p_mx) == _min_weight(bf_mx)

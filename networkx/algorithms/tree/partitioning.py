@@ -29,8 +29,9 @@ seed usually terminate the search after a handful of probes.
 
 - ``min_max_tree_partition``: O(N log N · B) — the feasibility oracle
   sorts children by residual weight at each node.
-- ``max_min_tree_partition``: O(N · B) — feasibility is a single
-  post-order pass with no per-node sort.
+- ``max_min_tree_partition``: O(N · B + N log N) — feasibility is a
+  single post-order pass with no per-node sort, but the final merge-down
+  of surplus parts sorts the winning probe's cuts once.
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ from __future__ import annotations
 import math
 import numbers
 import struct
-import sys
 from collections.abc import Hashable
 from typing import Any, NamedTuple
 
@@ -94,49 +94,44 @@ _WEIGHT_FUNCTIONS = {
 
 
 def _coerce_weight(w: Any) -> int | float:
-    """Keep integers exact (arbitrary precision); coerce all else to float."""
-    return w if isinstance(w, numbers.Integral) else float(w)
+    """Coerce to Python int (exact, arbitrary precision) or float.
+
+    ``int(w)`` matters for fixed-width integer types such as numpy's: they
+    pass ``isinstance(w, numbers.Integral)`` but silently wrap on overflow
+    if used in arithmetic directly.
+    """
+    return int(w) if isinstance(w, numbers.Integral) else float(w)
 
 
-def _check_node_weight(v: Hashable, w: Any) -> None:
-    """Shared node-weight validation: numeric, finite, > 0."""
+def _check_weight(elem: str, w: Any, is_node: bool) -> None:
+    """Shared weight validation: numeric, finite, node > 0 / edge >= 0."""
+    if isinstance(w, bool) or not isinstance(w, numbers.Number):
+        # Rejects numeric-looking strings (float("5") parses) and bools;
+        # both are near-certain data errors, not weights.
+        raise nx.NetworkXError(
+            f"{elem} has non-numeric weight {w!r}; all weights must be numbers."
+        )
     if not isinstance(w, numbers.Integral):
         # Integers are always finite (and may exceed float range, so must
         # not be converted); everything else must convert to a finite float.
         try:
             w = float(w)
-        except (TypeError, ValueError) as err:
+        except (TypeError, ValueError) as err:  # e.g. complex
             raise nx.NetworkXError(
-                f"Node {v!r} has non-numeric weight {w!r}; all weights must be numbers."
+                f"{elem} has non-numeric weight {w!r}; all weights must be numbers."
             ) from err
         if not math.isfinite(w):
             raise nx.NetworkXError(
-                f"Node {v!r} has non-finite weight {w!r}; all weights must be finite."
+                f"{elem} has non-finite weight {w!r}; all weights must be finite."
             )
-    if w <= 0:
-        raise nx.NetworkXError(
-            f"Node {v!r} has weight {w!r}; all node weights must be > 0."
-        )
-
-
-def _check_edge_weight(u: Hashable, v: Hashable, w: Any) -> None:
-    """Shared edge-weight validation: numeric, finite, >= 0."""
-    if not isinstance(w, numbers.Integral):
-        try:
-            w = float(w)
-        except (TypeError, ValueError) as err:
+    if is_node:
+        if w <= 0:
             raise nx.NetworkXError(
-                f"Edge ({u!r}, {v!r}) has non-numeric weight {w!r}; "
-                "all weights must be numbers."
-            ) from err
-        if not math.isfinite(w):
-            raise nx.NetworkXError(
-                f"Edge ({u!r}, {v!r}) has non-finite weight {w!r}; "
-                "all weights must be finite."
+                f"{elem} has weight {w!r}; all node weights must be > 0."
             )
-    if w < 0:
+    elif w < 0:
         raise nx.NetworkXError(
-            f"Edge ({u!r}, {v!r}) has weight {w!r}; all edge weights must be >= 0."
+            f"{elem} has weight {w!r}; all edge weights must be >= 0."
         )
 
 
@@ -148,44 +143,32 @@ def _check_edge_weight(u: Hashable, v: Hashable, w: Any) -> None:
 def _root_at_leaf(T: nx.Graph) -> Hashable:
     """Return a leaf node of T (degree 1, or the only node if |V|=1)."""
     if len(T) == 1:
-        return next(iter(T.nodes()))
+        return nx.utils.arbitrary_element(T)
     return next(v for v, d in T.degree() if d == 1)
 
 
-def _root_tree(
-    T: nx.Graph, root: Hashable
+def _rooted_setup(
+    T: nx.Graph, edge_w: dict[tuple[Hashable, Hashable], int | float]
 ) -> tuple[
+    Hashable,
     list[Hashable],
-    dict[Hashable, Hashable | None],
     dict[Hashable, list[Hashable]],
+    dict[Hashable, int | float],
 ]:
-    """Root tree at *root*.
+    """Root T at a leaf; shared setup for both bisection solvers.
 
-    Returns (post_order, parent, children) where:
-    - post_order: list of nodes in post-order (leaves first)
-    - parent: dict mapping node -> parent (root -> None)
-    - children: dict mapping node -> list of child nodes
+    Returns (root, post_order, children, ew_par) where post_order lists
+    nodes leaves-first, children maps every node to its (possibly empty)
+    child list, and ew_par maps each non-root node to the weight of the
+    edge to its parent.
     """
-    parent = {root: None}
-    children = {v: [] for v in T}
-    post_order = []
-    stack = [(root, iter(T.adj[root]))]
-    visited = {root}
-    while stack:
-        v, it = stack[-1]
-        found = False
-        for u in it:
-            if u not in visited:
-                visited.add(u)
-                parent[u] = v
-                children[v].append(u)
-                stack.append((u, iter(T.adj[u])))
-                found = True
-                break
-        if not found:
-            post_order.append(v)
-            stack.pop()
-    return post_order, parent, children
+    root = _root_at_leaf(T)
+    post_order = list(nx.dfs_postorder_nodes(T, root))
+    parent = nx.dfs_predecessors(T, root)
+    succ = nx.dfs_successors(T, root)
+    children = {v: succ.get(v, []) for v in T}
+    ew_par = {v: edge_w[v, p] for v, p in parent.items()}
+    return root, post_order, children, ew_par
 
 
 def _weight_maps(
@@ -222,8 +205,45 @@ def _weights_integral(
     edge_w: dict[tuple[Hashable, Hashable], int | float],
 ) -> bool:
     """True iff every weight is an integer, enabling exact integer bisection."""
-    return all(isinstance(w, numbers.Integral) for w in node_w.values()) and all(
-        isinstance(w, numbers.Integral) for w in edge_w.values()
+    return all(isinstance(w, int) for w in node_w.values()) and all(
+        isinstance(w, int) for w in edge_w.values()
+    )
+
+
+def _weights_as_floats(
+    node_w: dict[Hashable, int | float],
+    edge_w: dict[tuple[Hashable, Hashable], int | float],
+) -> tuple[
+    dict[Hashable, float],
+    dict[tuple[Hashable, Hashable], float],
+]:
+    """Convert mixed int/float weight maps to all-float.
+
+    Called only when not every weight is an integer.  The bisection then
+    runs on the grid of IEEE-754 doubles, which contains every achievable
+    component weight only if every individual weight is itself an exact
+    double — so an integer weight that would round on conversion raises
+    instead of silently yielding a partition the grid cannot certify.
+    """
+
+    def as_float(w):
+        if isinstance(w, int):
+            try:
+                f = float(w)
+            except OverflowError:
+                f = None
+            if f is None or f != w:
+                raise nx.NetworkXError(
+                    "cannot mix float weights with integer weights that are "
+                    "not exactly representable as floats; use all-integer "
+                    "weights for exact arbitrary-precision arithmetic."
+                )
+            return f
+        return w
+
+    return (
+        {k: as_float(w) for k, w in node_w.items()},
+        {k: as_float(w) for k, w in edge_w.items()},
     )
 
 
@@ -231,7 +251,7 @@ def _validate_partition_args(T: nx.Graph, q: int, spec: _WeightSpec) -> None:
     """Raise appropriate errors for invalid inputs."""
     if not nx.is_tree(T):
         raise nx.NotATree("input graph is not a tree")
-    if not isinstance(q, numbers.Integral):
+    if isinstance(q, bool) or not isinstance(q, numbers.Integral):
         raise nx.NetworkXError(f"q must be an integer, got {q!r}.")
     n = len(T)
     if q < 1 or q > n:
@@ -240,10 +260,10 @@ def _validate_partition_args(T: nx.Graph, q: int, spec: _WeightSpec) -> None:
         )
     if spec.node_attr is not None:
         for v in T.nodes:
-            _check_node_weight(v, T.nodes[v].get(spec.node_attr, 1))
+            _check_weight(f"Node {v!r}", T.nodes[v].get(spec.node_attr, 1), True)
     if spec.edge_attr is not None:
         for u, v, edata in T.edges(data=True):
-            _check_edge_weight(u, v, edata.get(spec.edge_attr, 1))
+            _check_weight(f"Edge ({u!r}, {v!r})", edata.get(spec.edge_attr, 1), False)
 
 
 # ---------------------------------------------------------------------------
@@ -258,26 +278,8 @@ def _components_from_cut_edges(
 
     *cut_edges* is a set of ``frozenset({u, v})`` keys.
     """
-    comps = []
-    visited = set()
-    for start in T:
-        if start in visited:
-            continue
-        comp = []
-        stk = [start]
-        visited.add(start)
-        while stk:
-            x = stk.pop()
-            comp.append(x)
-            for y in T.neighbors(x):
-                if y in visited:
-                    continue
-                if frozenset((x, y)) in cut_edges:
-                    continue
-                visited.add(y)
-                stk.append(y)
-        comps.append(comp)
-    return comps
+    view = nx.restricted_view(T, [], [tuple(e) for e in cut_edges])
+    return [list(c) for c in nx.connected_components(view)]
 
 
 def _component_weight(
@@ -287,16 +289,9 @@ def _component_weight(
     edge_w: dict[tuple[Hashable, Hashable], int | float],
 ) -> int | float:
     """Weight of a connected component: node weights + internal edge weights."""
-    total = 0
-    for v in comp_vertices:
-        total += node_w[v]
-    comp_set = set(comp_vertices)
-    counted = set()
-    for v in comp_vertices:
-        for u in T.adj[v]:
-            if u in comp_set and u not in counted:
-                total += edge_w[v, u]
-        counted.add(v)
+    total = sum(node_w[v] for v in comp_vertices)
+    for u, v in T.subgraph(comp_vertices).edges():
+        total += edge_w[u, v]
     return total
 
 
@@ -415,6 +410,22 @@ def _feasible_maxmin(
 # ---------------------------------------------------------------------------
 
 
+def _trivial_partition(
+    T: nx.Graph,
+    q: int,
+    node_w: dict[Hashable, int | float],
+    edge_w: dict[tuple[Hashable, Hashable], int | float],
+) -> list[tuple[frozenset, int | float]] | None:
+    """The q == 1 (whole tree) and q == n (all singletons) partitions,
+    common to both solvers; None when 1 < q < n."""
+    verts = list(T)
+    if q == 1:
+        return [(frozenset(verts), _component_weight(T, verts, node_w, edge_w))]
+    if q == len(T):
+        return [(frozenset([v]), node_w[v]) for v in verts]
+    return None
+
+
 def _add_cuts_to_reach_q(
     T: nx.Graph, cut_edges: set[frozenset[Hashable]], q: int
 ) -> set[frozenset[Hashable]]:
@@ -449,15 +460,15 @@ def _reduce_to_q_parts(
     """Reduce parts to exactly q for max-min by merging the lightest component
     with a neighbor, returning the final partition as (nodes, weight) pairs.
 
-    Uses union-find (merging vertex lists and weights in place, so the final
-    partition needs no second components-and-weights pass).  Sort keys are
-    computed once from the initial component weights and are not refreshed
-    after merges.  This still preserves the max-min optimum because the
-    lightest cut is always adjacent to the at-most-one sub-threshold
-    component, which is absorbed into a heavy neighbor before any
-    heavy-only cuts are considered; every resulting component therefore
-    contains at least one heavy initial component (weight >= lambda*).  The
-    reduction is optimal-valued though not necessarily optimal-shaped.
+    Uses ``nx.utils.UnionFind`` over component indices; vertices are
+    regrouped in a single pass at the end.  Sort keys are computed once
+    from the initial component weights and are not refreshed after merges.
+    This still preserves the max-min optimum because the lightest cut is
+    always adjacent to the at-most-one sub-threshold component, which is
+    absorbed into a heavy neighbor before any heavy-only cuts are
+    considered; every resulting component therefore contains at least one
+    heavy initial component (weight >= lambda*).  The reduction is
+    optimal-valued though not necessarily optimal-shaped.
     """
     comps = _components_from_cut_edges(T, cut_edges)
     weights = [_component_weight(T, c, node_w, edge_w) for c in comps]
@@ -468,16 +479,6 @@ def _reduce_to_q_parts(
     for i, comp in enumerate(comps):
         for v in comp:
             comp_of[v] = i
-
-    uf_parent = list(range(len(comps)))
-    uf_weight = list(weights)
-    uf_verts = comps  # merged in place; `comps` is not used afterwards
-
-    def find(x):
-        while uf_parent[x] != x:
-            uf_parent[x] = uf_parent[uf_parent[x]]
-            x = uf_parent[x]
-        return x
 
     # Deterministic tiebreaker: index each cut by its position in T.edges()
     # iteration, which follows adjacency-dict insertion order.  Using id(cut)
@@ -492,27 +493,26 @@ def _reduce_to_q_parts(
         cut_info.append((min_w, edge_index[cut], cut, ca, cb))
     cut_info.sort()
 
+    uf = nx.utils.UnionFind(range(len(comps)))
+    weight_of = dict(enumerate(weights))
     n_comps = len(comps)
     for _, _, cut, ca, cb in cut_info:
         if n_comps <= q:
             break
-        ra, rb = find(ca), find(cb)
+        ra, rb = uf[ca], uf[cb]
         if ra == rb:
             continue
-        # Union by vertex-list size keeps list merging O(n log n); root
-        # choice does not affect the resulting partition.
-        if len(uf_verts[ra]) > len(uf_verts[rb]):
-            ra, rb = rb, ra
-        uf_parent[ra] = rb
         a, b = tuple(cut)
         # Un-cutting reconnects the edge, so its weight rejoins the part.
-        uf_weight[rb] += uf_weight[ra] + edge_w[a, b]
-        uf_verts[rb].extend(uf_verts[ra])
-        uf_verts[ra] = []
+        merged_w = weight_of.pop(ra) + weight_of.pop(rb) + edge_w[a, b]
+        uf.union(ra, rb)
+        weight_of[uf[ra]] = merged_w
         n_comps -= 1
 
-    roots = {find(i) for i in range(len(uf_parent))}
-    return [(frozenset(uf_verts[r]), uf_weight[r]) for r in roots]
+    merged_verts = {}
+    for i, comp in enumerate(comps):
+        merged_verts.setdefault(uf[i], []).extend(comp)
+    return [(frozenset(vs), weight_of[r]) for r, vs in merged_verts.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -564,34 +564,6 @@ def _grid_next(x: int | float, integral: bool) -> int | float:
     return math.nextafter(x, math.inf)
 
 
-def _grid_up(w: int | float, integral: bool) -> int | float:
-    """Smallest grid value >= w (w itself when already on the grid)."""
-    if integral:
-        return w
-    try:
-        f = float(w)
-    except OverflowError:
-        # An all-integer component weight beyond float range in a tree that
-        # also has float weights; +inf is the smallest double >= w.
-        return math.inf
-    if f < w:
-        f = math.nextafter(f, math.inf)
-    return f
-
-
-def _grid_down(w: int | float, integral: bool) -> int | float:
-    """Largest grid value <= w (w itself when already on the grid)."""
-    if integral:
-        return w
-    try:
-        f = float(w)
-    except OverflowError:
-        return sys.float_info.max
-    if f > w:
-        f = math.nextafter(f, -math.inf)
-    return f
-
-
 # ---------------------------------------------------------------------------
 # Bisection solvers
 # ---------------------------------------------------------------------------
@@ -622,18 +594,11 @@ def _binary_search_minmax(
     point the upper bound is the exact optimum (with respect to the
     oracle's summation order in the float case).
     """
-    n = len(T)
-    verts = list(T)
+    trivial = _trivial_partition(T, q, node_w, edge_w)
+    if trivial is not None:
+        return trivial
 
-    if q == 1:
-        return [(frozenset(verts), _component_weight(T, verts, node_w, edge_w))]
-
-    if q == n:
-        return [(frozenset([v]), node_w[v]) for v in verts]
-
-    root = _root_at_leaf(T)
-    post_order, parent, children = _root_tree(T, root)
-    ew_par = {v: edge_w[v, p] for v, p in parent.items() if p is not None}
+    root, post_order, children, ew_par = _rooted_setup(T, edge_w)
 
     def probe(lam):
         ok, cuts, achieved = _feasible_minmax(
@@ -656,10 +621,9 @@ def _binary_search_minmax(
 
     # An unbounded threshold is always feasible with zero cuts; its achieved
     # weight (the whole-tree weight, in oracle summation order) seeds the
-    # feasible upper bound.
+    # feasible upper bound.  All weights are ints (integral mode) or floats
+    # (otherwise), so every achieved sum is already on the bisection grid.
     _, best_cuts, hi = probe(math.inf)
-    lo = _grid_down(lo, integral)
-    hi = _grid_up(hi, integral)
 
     # Pigeonhole seed: some part must weigh at least total/q.
     guess = -(-hi // q) if integral else hi / q
@@ -667,7 +631,7 @@ def _binary_search_minmax(
     if lo < guess < hi:
         ok, cuts, achieved = probe(guess)
         if ok:
-            hi = _grid_up(achieved, integral)
+            hi = achieved
             best_cuts = cuts
             verified = False
         else:
@@ -682,7 +646,7 @@ def _binary_search_minmax(
         mid = _grid_prev(hi, integral) if verifying else _grid_mid(lo, hi, integral)
         ok, cuts, achieved = probe(mid)
         if ok:
-            hi = _grid_up(achieved, integral)
+            hi = achieved
             best_cuts = cuts
             verified = verifying
         else:
@@ -706,18 +670,11 @@ def _binary_search_maxmin(
     the lightest heavy part achieved by each feasible probe, and the
     optimum is the final lower bound.
     """
-    n = len(T)
-    verts = list(T)
+    trivial = _trivial_partition(T, q, node_w, edge_w)
+    if trivial is not None:
+        return trivial
 
-    if q == 1:
-        return [(frozenset(verts), _component_weight(T, verts, node_w, edge_w))]
-
-    if q == n:
-        return [(frozenset([v]), node_w[v]) for v in verts]
-
-    root = _root_at_leaf(T)
-    post_order, parent, children = _root_tree(T, root)
-    ew_par = {v: edge_w[v, p] for v, p in parent.items() if p is not None}
+    root, post_order, children, ew_par = _rooted_setup(T, edge_w)
 
     def probe(lam):
         heavy_count, cuts, min_heavy, root_w = _feasible_maxmin(
@@ -726,17 +683,18 @@ def _binary_search_maxmin(
         return heavy_count >= q, cuts, min_heavy, root_w
 
     # lam = 0 cuts every edge (all weights are nonnegative), so it is
-    # feasible whenever q <= n; snap the feasible bound up to the lightest
-    # part it actually produced.
+    # feasible whenever q <= n; the lightest part it actually produced is
+    # the feasible lower bound.  All weights are ints (integral mode) or
+    # floats (otherwise), so every achieved sum is already on the grid.
     _, best_cuts, achieved, _ = probe(0)
-    lo = _grid_down(achieved, integral)
+    lo = achieved
 
     # No q >= 2 disjoint parts can each weigh as much as the whole tree
     # (unless the total is zero, in which case lo == hi already), so the
     # whole-tree weight — the unbounded probe's residual — is an infeasible
     # upper bound.
     _, _, _, total = probe(math.inf)
-    hi = _grid_up(total, integral)
+    hi = total
 
     # Pigeonhole seed: the lightest part can weigh at most total/q.
     guess = hi // q if integral else hi / q
@@ -744,7 +702,7 @@ def _binary_search_maxmin(
     if lo < guess < hi:
         ok, cuts, achieved, _ = probe(guess)
         if ok:
-            lo = _grid_down(achieved, integral)
+            lo = achieved
             best_cuts = cuts
             verified = False
         else:
@@ -759,7 +717,7 @@ def _binary_search_maxmin(
         mid = _grid_next(lo, integral) if verifying else _grid_mid(lo, hi, integral)
         ok, cuts, achieved, _ = probe(mid)
         if ok:
-            lo = _grid_down(achieved, integral)
+            lo = achieved
             best_cuts = cuts
             verified = verifying
         else:
@@ -786,14 +744,43 @@ def _resolve_weight_function(
     weight_function: str, node_weight: str, edge_weight: str
 ) -> _WeightSpec:
     """Map a weight-function name to its additive weight specification."""
+    # None is a common "use defaults" idiom elsewhere in networkx; here it
+    # would become the attribute name, match no attribute, and silently
+    # degrade e.g. vertex_weight_sum to vertex_count — so reject non-strings.
+    for name, value in (("node_weight", node_weight), ("edge_weight", edge_weight)):
+        if not isinstance(value, str):
+            raise nx.NetworkXError(
+                f"{name} must be a string naming an attribute, got {value!r}."
+            )
     try:
         make_spec = _WEIGHT_FUNCTIONS[weight_function]
-    except KeyError:
+    except (KeyError, TypeError):
         raise nx.NetworkXError(
             f"weight_function must be one of {sorted(_WEIGHT_FUNCTIONS)}, "
             f"got {weight_function!r}."
         ) from None
     return make_spec(node_weight, edge_weight)
+
+
+def _tree_partition(
+    T: nx.Graph,
+    q: int,
+    node_weight: str,
+    edge_weight: str,
+    weight_function: str,
+    solver,
+    descending: bool,
+) -> list[frozenset]:
+    """Shared driver behind both public entry points: resolve and validate,
+    build weight maps, pick the bisection grid, solve, and sort."""
+    spec = _resolve_weight_function(weight_function, node_weight, edge_weight)
+    _validate_partition_args(T, q, spec)
+    node_w, edge_w = _weight_maps(T, spec)
+    integral = _weights_integral(node_w, edge_w)
+    if not integral:
+        node_w, edge_w = _weights_as_floats(node_w, edge_w)
+    partition = solver(T, q, node_w, edge_w, integral)
+    return _sorted_components(partition, descending)
 
 
 # ---------------------------------------------------------------------------
@@ -806,8 +793,13 @@ def _resolve_weight_function(
 # node_attrs/edge_attrs are over-declared for weight_function="vertex_count"
 # (which reads neither attribute); the dispatcher will pass attribute data
 # through unused, which is benign and matches NetworkX convention for
-# optional-attribute dispatch.
-@nx._dispatchable(graphs="T", node_attrs="node_weight", edge_attrs="edge_weight")
+# optional-attribute dispatch.  Dict form, not node_attrs="node_weight":
+# string-form node_attrs declares a missing-attribute default of None to
+# backends, while this implementation (and string-form edge_attrs) defaults
+# missing attributes to 1.
+@nx._dispatchable(
+    graphs="T", node_attrs={"node_weight": 1}, edge_attrs={"edge_weight": 1}
+)
 def min_max_tree_partition(
     T: nx.Graph,
     q: int,
@@ -870,10 +862,11 @@ def min_max_tree_partition(
 
     NetworkXError
         If ``q`` is not an integer, ``q`` is not in ``[1, len(T)]``,
-        ``weight_function`` is unrecognised, a node or edge weight is
-        invalid for the selected weight function (non-numeric, non-finite,
-        or out of range), or float weights are mixed with integer weights
-        too large to represent as floats.
+        ``weight_function`` is unrecognised, ``node_weight`` or
+        ``edge_weight`` is not a string, a node or edge weight is invalid
+        for the selected weight function (non-numeric, non-finite, or out
+        of range), or float weights are mixed with integer weights that
+        cannot be represented exactly as floats.
 
     NetworkXPointlessConcept
         If ``T`` has no nodes.
@@ -892,9 +885,11 @@ def min_max_tree_partition(
     snaps to weights actually achieved by feasible probes, so there are no
     tolerance parameters.  When every weight is an integer the grid is the
     integers (Python's arbitrary-precision ``int``) and the result is exact
-    at any magnitude; otherwise the grid is the IEEE-754 doubles and the
-    result is exact with respect to floating-point summation of component
-    weights.  With B feasibility probes (B = O(64) for float weights,
+    at any magnitude; otherwise every weight is converted to a float
+    (raising if an integer weight would round), the grid is the IEEE-754
+    doubles, and the result is exact with respect to floating-point
+    summation of component weights.  With B feasibility probes (B = O(64)
+    for float weights,
     B = O(log W) for integer weights of total magnitude W; a pigeonhole
     seed and candidate-verification probes usually finish far sooner),
     each costing O(n log n) for the sort, the overall complexity is
@@ -929,26 +924,25 @@ def min_max_tree_partition(
     >>> sorted(sorted(p) for p in parts)
     [[0, 1], [2, 3]]
     """
-    spec = _resolve_weight_function(weight_function, node_weight, edge_weight)
-    _validate_partition_args(T, q, spec)
-    node_w, edge_w = _weight_maps(T, spec)
-    integral = _weights_integral(node_w, edge_w)
-    try:
-        partition = _binary_search_minmax(T, q, node_w, edge_w, integral)
-    except OverflowError as err:
-        raise nx.NetworkXError(
-            "cannot mix float weights with integer weights beyond float "
-            "range; use all-integer weights for exact arbitrary-precision "
-            "arithmetic."
-        ) from err
-    return _sorted_components(partition, descending=True)
+    return _tree_partition(
+        T,
+        q,
+        node_weight,
+        edge_weight,
+        weight_function,
+        _binary_search_minmax,
+        descending=True,
+    )
 
 
 @nx.utils.not_implemented_for("directed")
 @nx.utils.not_implemented_for("multigraph")
 # See min_max_tree_partition: node_attrs/edge_attrs are deliberately
-# over-declared for the vertex_count weight function.
-@nx._dispatchable(graphs="T", node_attrs="node_weight", edge_attrs="edge_weight")
+# over-declared for the vertex_count weight function and use the dict form
+# to declare the missing-attribute default of 1.
+@nx._dispatchable(
+    graphs="T", node_attrs={"node_weight": 1}, edge_attrs={"edge_weight": 1}
+)
 def max_min_tree_partition(
     T: nx.Graph,
     q: int,
@@ -1011,10 +1005,11 @@ def max_min_tree_partition(
 
     NetworkXError
         If ``q`` is not an integer, ``q`` is not in ``[1, len(T)]``,
-        ``weight_function`` is unrecognised, a node or edge weight is
-        invalid for the selected weight function (non-numeric, non-finite,
-        or out of range), or float weights are mixed with integer weights
-        too large to represent as floats.
+        ``weight_function`` is unrecognised, ``node_weight`` or
+        ``edge_weight`` is not a string, a node or edge weight is invalid
+        for the selected weight function (non-numeric, non-finite, or out
+        of range), or float weights are mixed with integer weights that
+        cannot be represented exactly as floats.
 
     NetworkXPointlessConcept
         If ``T`` has no nodes.
@@ -1033,12 +1028,16 @@ def max_min_tree_partition(
     snaps to weights actually achieved by feasible probes, so there are no
     tolerance parameters.  When every weight is an integer the grid is the
     integers (Python's arbitrary-precision ``int``) and the result is exact
-    at any magnitude; otherwise the grid is the IEEE-754 doubles and the
-    result is exact with respect to floating-point summation of component
-    weights.  With B feasibility probes (B = O(64) for float weights,
+    at any magnitude; otherwise every weight is converted to a float
+    (raising if an integer weight would round), the grid is the IEEE-754
+    doubles, and the result is exact with respect to floating-point
+    summation of component weights.  With B feasibility probes (B = O(64)
+    for float weights,
     B = O(log W) for integer weights of total magnitude W; a pigeonhole
     seed and candidate-verification probes usually finish far sooner),
-    each costing O(n), the overall complexity is :math:`O(n \cdot B)`.
+    each costing O(n), plus a final reduction that sorts the winning
+    probe's cuts once, the overall complexity is
+    :math:`O(n \cdot B + n \log n)`.
 
     References
     ----------
@@ -1074,16 +1073,12 @@ def max_min_tree_partition(
     >>> sorted(sorted(p) for p in parts)
     [[0, 1], [2, 3]]
     """
-    spec = _resolve_weight_function(weight_function, node_weight, edge_weight)
-    _validate_partition_args(T, q, spec)
-    node_w, edge_w = _weight_maps(T, spec)
-    integral = _weights_integral(node_w, edge_w)
-    try:
-        partition = _binary_search_maxmin(T, q, node_w, edge_w, integral)
-    except OverflowError as err:
-        raise nx.NetworkXError(
-            "cannot mix float weights with integer weights beyond float "
-            "range; use all-integer weights for exact arbitrary-precision "
-            "arithmetic."
-        ) from err
-    return _sorted_components(partition, descending=False)
+    return _tree_partition(
+        T,
+        q,
+        node_weight,
+        edge_weight,
+        weight_function,
+        _binary_search_maxmin,
+        descending=False,
+    )
