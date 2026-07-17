@@ -39,7 +39,7 @@ from __future__ import annotations
 import math
 import numbers
 import struct
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from typing import Any, NamedTuple
 
 import networkx as nx
@@ -103,35 +103,49 @@ def _coerce_weight(w: Any) -> int | float:
     return int(w) if isinstance(w, numbers.Integral) else float(w)
 
 
-def _check_weight(elem: str, w: Any, is_node: bool) -> None:
-    """Shared weight validation: numeric, finite, node > 0 / edge >= 0."""
+def _check_weight(w: Any, elem: Any, is_node: bool) -> None:
+    """Shared weight validation: numeric, finite, node > 0 / edge >= 0.
+
+    *elem* is the node label or ``(u, v)`` edge tuple, used only in error
+    messages (formatted lazily so the happy path pays no repr cost).
+    """
+
+    def label():
+        return f"Node {elem!r}" if is_node else f"Edge {elem!r}"
+
     if isinstance(w, bool) or not isinstance(w, numbers.Number):
         # Rejects numeric-looking strings (float("5") parses) and bools;
         # both are near-certain data errors, not weights.
         raise nx.NetworkXError(
-            f"{elem} has non-numeric weight {w!r}; all weights must be numbers."
+            f"{label()} has non-numeric weight {w!r}; all weights must be numbers."
         )
     if not isinstance(w, numbers.Integral):
         # Integers are always finite (and may exceed float range, so must
         # not be converted); everything else must convert to a finite float.
         try:
-            w = float(w)
+            wf = float(w)
         except (TypeError, ValueError) as err:  # e.g. complex
             raise nx.NetworkXError(
-                f"{elem} has non-numeric weight {w!r}; all weights must be numbers."
+                f"{label()} has non-numeric weight {w!r}; all weights must be numbers."
             ) from err
-        if not math.isfinite(w):
+        except OverflowError as err:  # e.g. Fraction(10**400)
             raise nx.NetworkXError(
-                f"{elem} has non-finite weight {w!r}; all weights must be finite."
+                f"{label()} has weight {w!r} too large to represent as a "
+                "float; all non-integer weights must fit in a float."
+            ) from err
+        if not math.isfinite(wf):
+            raise nx.NetworkXError(
+                f"{label()} has non-finite weight {w!r}; all weights must be finite."
             )
+        w = wf
     if is_node:
         if w <= 0:
             raise nx.NetworkXError(
-                f"{elem} has weight {w!r}; all node weights must be > 0."
+                f"{label()} has weight {w!r}; all node weights must be > 0."
             )
     elif w < 0:
         raise nx.NetworkXError(
-            f"{elem} has weight {w!r}; all edge weights must be >= 0."
+            f"{label()} has weight {w!r}; all edge weights must be >= 0."
         )
 
 
@@ -260,10 +274,10 @@ def _validate_partition_args(T: nx.Graph, q: int, spec: _WeightSpec) -> None:
         )
     if spec.node_attr is not None:
         for v in T.nodes:
-            _check_weight(f"Node {v!r}", T.nodes[v].get(spec.node_attr, 1), True)
+            _check_weight(T.nodes[v].get(spec.node_attr, 1), v, True)
     if spec.edge_attr is not None:
         for u, v, edata in T.edges(data=True):
-            _check_weight(f"Edge ({u!r}, {v!r})", edata.get(spec.edge_attr, 1), False)
+            _check_weight(edata.get(spec.edge_attr, 1), (u, v), False)
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +578,66 @@ def _grid_next(x: int | float, integral: bool) -> int | float:
     return math.nextafter(x, math.inf)
 
 
+_Cuts = list[tuple[Hashable, Hashable]]
+
+
+def _bisect_threshold(
+    probe: Callable[[int | float], tuple[bool, _Cuts | None, int | float | None]],
+    bad: int | float,
+    good: int | float,
+    best_cuts: _Cuts,
+    guess: int | float,
+    minimize: bool,
+    integral: bool,
+) -> _Cuts:
+    """Verified grid bisection shared by both solvers.
+
+    *good* is the feasible bound — the upper bound when *minimize* is true
+    (min-max), the lower bound otherwise (max-min) — and always equals the
+    weight achieved by *best_cuts*; *bad* is the infeasible bound on the
+    other side.  *probe* maps a threshold to ``(ok, cuts, achieved)``,
+    where *achieved* is on the bisection grid whenever *ok*.  Every
+    achievable component weight is on the grid, so when no grid value lies
+    strictly between the bounds, *good* is the exact optimum; returns the
+    cuts achieving it.
+
+    Two probe-count optimizations preserve exactness because every probe
+    determines which side of the optimum it lands on:
+
+    - the seed *guess* is probed first when it lies strictly inside the
+      bracket, so the search starts near the caller's estimate instead of
+      the bit-space middle;
+    - candidate verification: after each snap of *good* to an achieved
+      weight, probe one grid step past it — if that is infeasible the
+      candidate is optimal and the search ends immediately; alternated
+      with bisection steps so the worst case stays O(grid bisection).
+    """
+    step = _grid_prev if minimize else _grid_next
+
+    def bracket():
+        return (bad, good) if minimize else (good, bad)
+
+    lo, hi = bracket()
+    verified = True
+    if lo < guess < hi:
+        ok, cuts, achieved = probe(guess)
+        if ok:
+            good, best_cuts, verified = achieved, cuts, False
+        else:
+            bad = guess
+        lo, hi = bracket()
+    while not _grid_adjacent(lo, hi, integral):
+        verifying = not verified
+        mid = step(good, integral) if verifying else _grid_mid(lo, hi, integral)
+        ok, cuts, achieved = probe(mid)
+        if ok:
+            good, best_cuts, verified = achieved, cuts, verifying
+        else:
+            bad, verified = mid, True
+        lo, hi = bracket()
+    return best_cuts
+
+
 # ---------------------------------------------------------------------------
 # Bisection solvers
 # ---------------------------------------------------------------------------
@@ -578,21 +652,12 @@ def _binary_search_minmax(
 ) -> list[tuple[frozenset, int | float]]:
     """Min-max q-partition via exact grid bisection + greedy oracle.
 
-    Bisects the grid of representable threshold values, snapping the
-    feasible upper bound to the weight actually achieved by each feasible
-    probe.  Two probe-count optimizations preserve exactness because every
-    probe verifies which side of the optimum it lands on:
-
-    - a pigeonhole seed (some part must weigh at least total/q, so the
-      first probe lands near the average instead of bit-space middle);
-    - candidate verification (after each snap, probe one grid step below
-      the candidate — if that is infeasible the candidate is optimal and
-      the search ends immediately; alternated with bisection steps so the
-      worst case stays O(grid bisection)).
-
-    Terminates when the bracket contains no interior grid point, at which
-    point the upper bound is the exact optimum (with respect to the
-    oracle's summation order in the float case).
+    Bisects the grid of representable threshold values (see
+    `_bisect_threshold` for the seeding and candidate-verification
+    scheme), snapping the feasible upper bound to the weight actually
+    achieved by each feasible probe; the final upper bound is the exact
+    optimum (with respect to the oracle's summation order in the float
+    case).
     """
     trivial = _trivial_partition(T, q, node_w, edge_w)
     if trivial is not None:
@@ -625,34 +690,15 @@ def _binary_search_minmax(
     # (otherwise), so every achieved sum is already on the bisection grid.
     _, best_cuts, hi = probe(math.inf)
 
-    # Pigeonhole seed: some part must weigh at least total/q.
+    # Seed near total/q: with node-additive weights some part must weigh at
+    # least total/q (pigeonhole); with edge weights, cut edges leave the
+    # total, so it is only a heuristic starting probe.  Correctness is
+    # unaffected either way — every probe verifies which side of the
+    # optimum it lands on.
     guess = -(-hi // q) if integral else hi / q
-    verified = True
-    if lo < guess < hi:
-        ok, cuts, achieved = probe(guess)
-        if ok:
-            hi = achieved
-            best_cuts = cuts
-            verified = False
-        else:
-            lo = guess
-
-    # Invariants: lo is infeasible, hi is feasible and achieved by
-    # best_cuts, and the optimum lies in (lo, hi].  Every achievable
-    # component weight is on the grid, so an empty open bracket means
-    # hi is the optimum.
-    while not _grid_adjacent(lo, hi, integral):
-        verifying = not verified
-        mid = _grid_prev(hi, integral) if verifying else _grid_mid(lo, hi, integral)
-        ok, cuts, achieved = probe(mid)
-        if ok:
-            hi = achieved
-            best_cuts = cuts
-            verified = verifying
-        else:
-            lo = mid
-            verified = True
-
+    best_cuts = _bisect_threshold(
+        probe, lo, hi, best_cuts, guess, minimize=True, integral=integral
+    )
     return cuts_to_partition(best_cuts)
 
 
@@ -665,10 +711,9 @@ def _binary_search_maxmin(
 ) -> list[tuple[frozenset, int | float]]:
     """Max-min q-partition via exact grid bisection + greedy oracle.
 
-    Mirror image of `_binary_search_minmax` (see there for the seeding and
-    candidate-verification scheme): the feasible lower bound snaps up to
-    the lightest heavy part achieved by each feasible probe, and the
-    optimum is the final lower bound.
+    Mirror image of `_binary_search_minmax`, sharing `_bisect_threshold`:
+    the feasible lower bound snaps up to the lightest heavy part achieved
+    by each feasible probe, and the optimum is the final lower bound.
     """
     trivial = _trivial_partition(T, q, node_w, edge_w)
     if trivial is not None:
@@ -686,44 +731,26 @@ def _binary_search_maxmin(
     # feasible whenever q <= n; the lightest part it actually produced is
     # the feasible lower bound.  All weights are ints (integral mode) or
     # floats (otherwise), so every achieved sum is already on the grid.
-    _, best_cuts, achieved, _ = probe(0)
-    lo = achieved
+    _, best_cuts, lo, _ = probe(0)
 
     # No q >= 2 disjoint parts can each weigh as much as the whole tree
     # (unless the total is zero, in which case lo == hi already), so the
     # whole-tree weight — the unbounded probe's residual — is an infeasible
     # upper bound.
-    _, _, _, total = probe(math.inf)
-    hi = total
+    _, _, _, hi = probe(math.inf)
 
-    # Pigeonhole seed: the lightest part can weigh at most total/q.
+    # Pigeonhole seed: the lightest part can weigh at most total/q (part
+    # weights sum to at most the whole-tree weight in every weight mode).
     guess = hi // q if integral else hi / q
-    verified = True
-    if lo < guess < hi:
-        ok, cuts, achieved, _ = probe(guess)
-        if ok:
-            lo = achieved
-            best_cuts = cuts
-            verified = False
-        else:
-            hi = guess
-
-    # Invariants: lo is feasible and achieved by best_cuts, hi is
-    # infeasible, and the optimum lies in [lo, hi).  Every achievable
-    # component weight is on the grid, so an empty open bracket means
-    # lo is the optimum.
-    while not _grid_adjacent(lo, hi, integral):
-        verifying = not verified
-        mid = _grid_next(lo, integral) if verifying else _grid_mid(lo, hi, integral)
-        ok, cuts, achieved, _ = probe(mid)
-        if ok:
-            lo = achieved
-            best_cuts = cuts
-            verified = verifying
-        else:
-            hi = mid
-            verified = True
-
+    best_cuts = _bisect_threshold(
+        lambda lam: probe(lam)[:3],
+        hi,
+        lo,
+        best_cuts,
+        guess,
+        minimize=False,
+        integral=integral,
+    )
     return _reduce_to_q_parts(T, {frozenset(e) for e in best_cuts}, q, node_w, edge_w)
 
 
@@ -790,13 +817,16 @@ def _tree_partition(
 
 @nx.utils.not_implemented_for("directed")
 @nx.utils.not_implemented_for("multigraph")
-# node_attrs/edge_attrs are over-declared for weight_function="vertex_count"
-# (which reads neither attribute); the dispatcher will pass attribute data
-# through unused, which is benign and matches NetworkX convention for
-# optional-attribute dispatch.  Dict form, not node_attrs="node_weight":
-# string-form node_attrs declares a missing-attribute default of None to
-# backends, while this implementation (and string-form edge_attrs) defaults
-# missing attributes to 1.
+# node_attrs/edge_attrs are over-declared for weight functions that read
+# fewer attributes (e.g. "vertex_count" reads neither): the dispatch DSL
+# cannot condition declarations on the weight_function argument, so with a
+# backend active, graph conversion may materialize an attribute the
+# selected weight_function ignores — benign for numeric values, though a
+# backend could choke on non-numeric values in an ignored attribute that
+# the reference implementation would never read.  Dict form, not
+# node_attrs="node_weight": string-form node_attrs declares a
+# missing-attribute default of None to backends, while this implementation
+# (and string-form edge_attrs) defaults missing attributes to 1.
 @nx._dispatchable(
     graphs="T", node_attrs={"node_weight": 1}, edge_attrs={"edge_weight": 1}
 )
@@ -831,9 +861,11 @@ def min_max_tree_partition(
 
     node_weight : str, optional (default ``"weight"``)
         Node attribute key read by ``"vertex_weight_sum"`` and ``"mixed_sum"``.
+        Nodes missing the attribute are assigned weight 1.
 
     edge_weight : str, optional (default ``"weight"``)
         Edge attribute key read by ``"edge_weight_sum"`` and ``"mixed_sum"``.
+        Edges missing the attribute are assigned weight 1.
 
     weight_function : str, optional (default ``"vertex_weight_sum"``)
         How component weight is defined.  One of:
@@ -894,6 +926,12 @@ def min_max_tree_partition(
     seed and candidate-verification probes usually finish far sooner),
     each costing O(n log n) for the sort, the overall complexity is
     :math:`O(n \log n \cdot B)`.
+
+    ``weight_function`` is a fixed set of names rather than an arbitrary
+    callable because the greedy feasibility oracle and the exact grid
+    bisection both rely on component weight being additive over node and
+    edge weights; non-additive objectives (e.g. component diameter) would
+    silently break optimality.
 
     References
     ----------
@@ -974,9 +1012,11 @@ def max_min_tree_partition(
 
     node_weight : str, optional (default ``"weight"``)
         Node attribute key read by ``"vertex_weight_sum"`` and ``"mixed_sum"``.
+        Nodes missing the attribute are assigned weight 1.
 
     edge_weight : str, optional (default ``"weight"``)
         Edge attribute key read by ``"edge_weight_sum"`` and ``"mixed_sum"``.
+        Edges missing the attribute are assigned weight 1.
 
     weight_function : str, optional (default ``"vertex_weight_sum"``)
         How component weight is defined.  One of:
@@ -1038,6 +1078,12 @@ def max_min_tree_partition(
     each costing O(n), plus a final reduction that sorts the winning
     probe's cuts once, the overall complexity is
     :math:`O(n \cdot B + n \log n)`.
+
+    ``weight_function`` is a fixed set of names rather than an arbitrary
+    callable because the greedy feasibility oracle and the exact grid
+    bisection both rely on component weight being additive over node and
+    edge weights; non-additive objectives (e.g. component diameter) would
+    silently break optimality.
 
     References
     ----------

@@ -8,9 +8,9 @@ Covers:
 - Edge cases: q=1, q=n, single-node trees, two-node trees.
 - Random sampling: random labeled trees compared against the brute-force reference
   to verify consistency of the public API for both min-max and max-min problems.
-- Bound-sanity: lower bounds on OPT_minmax (average, max-node-weight, bottleneck-node,
-  edge-separator) and upper bounds on OPT_maxmin (average, heavy-node) bracket the
-  algorithm's output on large trees where brute force is not tractable.
+- Bound-sanity: lower bounds on OPT_minmax (average, max-node-weight,
+  bottleneck-node) and upper bounds on OPT_maxmin (average, heavy-node) bracket
+  the algorithm's output on large trees where brute force is not tractable.
 - Weight functions: randomized brute-force validation for all four built-in
   weight functions (vertex_weight_sum, edge_weight_sum, mixed_sum,
   vertex_count).
@@ -217,8 +217,7 @@ def _is_valid_partition(
         if wf is not None:
             expected_w = _component_weight_via_wf(T, list(nodes), wf)
         else:
-            W = {v: T.nodes[v].get(weight, 1) for v in T.nodes}
-            expected_w = sum(W[v] for v in nodes)
+            expected_w = sum(T.nodes[v].get(weight, 1) for v in nodes)
         if not math.isclose(reported_w, expected_w):
             return False
     return seen == all_nodes
@@ -234,6 +233,20 @@ def _is_sorted_ascending(partition: list[tuple[frozenset, float]]) -> bool:
     return all(weights[i] <= weights[i + 1] for i in range(len(weights) - 1))
 
 
+def _bfs_parents_order(T: nx.Graph) -> tuple[object, dict, list]:
+    """Root T at an arbitrary node via BFS; return (root, parent, order).
+
+    ``parent`` maps each node to its BFS parent (None for the root) and
+    ``order`` lists nodes root-first in BFS discovery order, so iterating
+    ``reversed(order)`` visits children before parents.
+    """
+    root = next(iter(T.nodes))
+    pairs = list(nx.bfs_predecessors(T, root))
+    parent = {root: None, **dict(pairs)}
+    order = [root, *(v for v, _ in pairs)]
+    return root, parent, order
+
+
 def _greedy_partition_bounds(
     T: nx.Graph, q: int, weight: str = "weight"
 ) -> tuple[float, float]:
@@ -247,19 +260,7 @@ def _greedy_partition_bounds(
     total = sum(W_node.values())
     threshold = total / q
 
-    root = next(iter(T.nodes))
-    parent: dict = {root: None}
-    bfs_order = [root]
-    visited = {root}
-    i = 0
-    while i < len(bfs_order):
-        v = bfs_order[i]
-        i += 1
-        for u in T.neighbors(v):
-            if u not in visited:
-                visited.add(u)
-                parent[u] = v
-                bfs_order.append(u)
+    root, parent, bfs_order = _bfs_parents_order(T)
 
     subtree_w = dict(W_node)
     piece_weights = []
@@ -361,6 +362,18 @@ def _comb_graph(s: int, d: int) -> nx.Graph:
     return G
 
 
+def _caterpillar(spine: int, leaves_per_node: int = 1) -> nx.Graph:
+    """Path spine 0..spine-1; each spine node has leaves_per_node pendant
+    leaves (labeled spine, spine+1, ...)."""
+    G = nx.path_graph(spine)
+    next_node = spine
+    for v in range(spine):
+        for _ in range(leaves_per_node):
+            G.add_edge(v, next_node)
+            next_node += 1
+    return G
+
+
 # ---------------------------------------------------------------------------
 # Tighter analytical bounds
 # ---------------------------------------------------------------------------
@@ -370,19 +383,7 @@ def _bottleneck_node_lb_minmax(T: nx.Graph, q: int, weight: str = "weight") -> f
     """Lower bound on OPT_minmax from the bottleneck-node argument."""
     W_node = {v: T.nodes[v].get(weight, 1) for v in T.nodes}
 
-    root = next(iter(T.nodes))
-    parent: dict = {root: None}
-    bfs_order: list = [root]
-    visited: set = {root}
-    i = 0
-    while i < len(bfs_order):
-        v = bfs_order[i]
-        i += 1
-        for u in T.neighbors(v):
-            if u not in visited:
-                visited.add(u)
-                parent[u] = v
-                bfs_order.append(u)
+    root, parent, bfs_order = _bfs_parents_order(T)
 
     sub_w: dict = dict(W_node)
     for v in reversed(bfs_order):
@@ -409,12 +410,6 @@ def _bottleneck_node_lb_minmax(T: nx.Graph, q: int, weight: str = "weight") -> f
         best_lb = max(best_lb, lb)
 
     return best_lb
-
-
-def _edge_separator_lb_minmax(T: nx.Graph, q: int, weight: str = "weight") -> float:
-    """Lower bound on OPT_minmax: just returns W_total / q."""
-    W_node = {v: T.nodes[v].get(weight, 1) for v in T.nodes}
-    return sum(W_node.values()) / q
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +581,17 @@ class TestValidation:
             _minmax(G, 2, weight_function="edge_weight_sum")
         with pytest.raises(nx.NetworkXError, match="non-numeric"):
             _maxmin(G, 2, weight_function="edge_weight_sum")
+
+    @pytest.mark.parametrize("fn", [min_max_tree_partition, max_min_tree_partition])
+    def test_huge_non_integral_weight_raises_networkx_error(self, fn):
+        """Pre-fix, a Fraction weight beyond float range leaked a bare
+        OverflowError from float() instead of the documented NetworkXError."""
+        from fractions import Fraction
+
+        G = nx.path_graph(3)
+        G.nodes[1]["weight"] = Fraction(10**400, 3)
+        with pytest.raises(nx.NetworkXError, match="too large"):
+            fn(G, 2)
 
     def test_mixed_huge_int_and_float_weights_raise(self):
         """Integers beyond float range are exact in all-integer trees, but
@@ -805,18 +811,8 @@ class TestBalancedBinaryTrees:
 
 
 class TestCaterpillarTrees:
-    @staticmethod
-    def _caterpillar(path_len: int, leaves_per_node: int = 1) -> nx.Graph:
-        G = nx.path_graph(path_len)
-        next_node = path_len
-        for v in range(path_len):
-            for _ in range(leaves_per_node):
-                G.add_edge(v, next_node)
-                next_node += 1
-        return G
-
     def test_caterpillar_spine3_leaves1_q2(self):
-        G = self._caterpillar(3, 1)
+        G = _caterpillar(3, 1)
         assert len(G) == 6
         p_mm = _minmax(G, 2)
         assert _is_valid_partition(G, p_mm, 2)
@@ -827,7 +823,7 @@ class TestCaterpillarTrees:
         assert _min_weight(p_mx) == 2
 
     def test_caterpillar_spine4_leaves1_q3(self):
-        G = self._caterpillar(4, 1)
+        G = _caterpillar(4, 1)
         assert len(G) == 8
         p_mm = _minmax(G, 3)
         assert _is_valid_partition(G, p_mm, 3)
@@ -838,7 +834,7 @@ class TestCaterpillarTrees:
         assert _min_weight(p_mx) == 2
 
     def test_caterpillar_spine3_leaves2_q3(self):
-        G = self._caterpillar(3, 2)
+        G = _caterpillar(3, 2)
         assert len(G) == 9
         p_mm = _minmax(G, 3)
         assert _is_valid_partition(G, p_mm, 3)
@@ -849,7 +845,7 @@ class TestCaterpillarTrees:
         assert _min_weight(p_mx) == 3
 
     def test_caterpillar_spine4_leaves2_q4(self):
-        G = self._caterpillar(4, 2)
+        G = _caterpillar(4, 2)
         assert len(G) == 12
         p_mm = _minmax(G, 4)
         assert _is_valid_partition(G, p_mm, 4)
@@ -948,7 +944,9 @@ class TestRandomSampling:
     """Generate random labeled trees and verify the public functions match the
     internal brute-force reference."""
 
-    @pytest.mark.parametrize("seed", [0, 1, 7, 13, 42, 99, 123, 256])
+    SEEDS = [0, 1, 5, 7, 9, 13, 17, 31, 42, 50, 77, 99, 100, 123, 200, 256]
+
+    @pytest.mark.parametrize("seed", SEEDS)
     def test_random_min_max_matches_brute_force(self, seed):
         rng = random.Random(seed)
         n = rng.randint(3, 11)
@@ -965,7 +963,7 @@ class TestRandomSampling:
         assert _is_sorted_descending(p_public)
         assert _max_weight(p_public) == _max_weight(p_ref)
 
-    @pytest.mark.parametrize("seed", [0, 1, 7, 13, 42, 99, 123, 256])
+    @pytest.mark.parametrize("seed", SEEDS)
     def test_random_max_min_matches_brute_force(self, seed):
         rng = random.Random(seed)
         n = rng.randint(3, 11)
@@ -995,45 +993,14 @@ class TestRandomSampling:
 
 
 # ---------------------------------------------------------------------------
-# Default vs brute-force agreement (small random trees)
+# Float-weight vs brute-force agreement (small random trees)
 # ---------------------------------------------------------------------------
 
 
-class TestDefaultVsBruteForce:
-    """Verify the binary-search algorithm agrees with brute-force on small random
-    trees where brute-force is tractable (n <= 12)."""
-
-    @pytest.mark.parametrize("seed", [0, 1, 5, 9, 17, 31, 50, 77, 100, 200])
-    def test_min_max_agrees(self, seed):
-        rng = random.Random(seed)
-        n = rng.randint(3, 11)
-        T = nx.random_labeled_tree(n, seed=seed)
-        for v in T.nodes:
-            T.nodes[v]["weight"] = rng.randint(1, 10)
-        q = rng.randint(1, min(n, 4))
-
-        wf = _wf("vertex_weight_sum")
-        p_default = _minmax(T, q, node_weight="weight")
-        p_brute = _brute_force_partition(T, q, wf, maximize_min=False)
-
-        assert _is_valid_partition(T, p_default, q, weight="weight")
-        assert _max_weight(p_default) == _max_weight(p_brute)
-
-    @pytest.mark.parametrize("seed", [0, 1, 5, 9, 17, 31, 50, 77, 100, 200])
-    def test_max_min_agrees(self, seed):
-        rng = random.Random(seed)
-        n = rng.randint(3, 11)
-        T = nx.random_labeled_tree(n, seed=seed)
-        for v in T.nodes:
-            T.nodes[v]["weight"] = rng.randint(1, 10)
-        q = rng.randint(1, min(n, 4))
-
-        wf = _wf("vertex_weight_sum")
-        p_default = _maxmin(T, q, node_weight="weight")
-        p_brute = _brute_force_partition(T, q, wf, maximize_min=True)
-
-        assert _is_valid_partition(T, p_default, q, weight="weight")
-        assert _min_weight(p_default) == _min_weight(p_brute)
+class TestFloatWeightsVsBruteForce:
+    """Verify the binary-search algorithm agrees with brute-force on small
+    random trees with float weights (integer weights are covered by
+    TestRandomSampling)."""
 
     @pytest.mark.parametrize("seed", [0, 1, 5, 9, 17])
     def test_min_max_float_weights(self, seed):
@@ -1176,13 +1143,7 @@ class TestLargeAnalytical:
         [(5, 3), (10, 2), (8, 4)],
     )
     def test_uniform_caterpillar_perfect_partition_large(self, spine, leaves_per_node):
-        G = nx.path_graph(spine)
-        next_node = spine
-        for v in range(spine):
-            for _ in range(leaves_per_node):
-                G.add_edge(v, next_node)
-                next_node += 1
-
+        G = _caterpillar(spine, leaves_per_node)
         q = spine
         expected = leaves_per_node + 1
 
@@ -1279,7 +1240,6 @@ class TestBoundSanity:
             W / q,
             max_w,
             _bottleneck_node_lb_minmax(T, q, weight=weight),
-            _edge_separator_lb_minmax(T, q, weight=weight),
         )
 
         ub_maxmin = W / q
@@ -1804,26 +1764,8 @@ class TestEdgeWeightSumAnalytic:
         [(3, 1.0, 2.0), (5, 2.0, 3.0), (4, 1.5, 4.5)],
     )
     def test_path_paired_edge_weights(self, m, a, b):
-        """P_{2m+1} with 2m edges: weights [a, b] repeated m times, q=m.
-
-        Cut at edges 1, 3, 5, ... (0-indexed) → m parts.
-        Part 0: nodes {0,1,2}, edges (0,1)=a and (1,2)=b → weight a+b.
-        Part k: nodes {2k, 2k+1, 2k+2}, edges a and b → weight a+b.
-        Last part: nodes {2m-2, 2m-1, 2m}, same → weight a+b.
-        Wait — with 2m+1 nodes and m-1 cuts we get m parts of ~3 nodes.
-
-        Actually: P_{2m} with 2m-1 edges, q=m, cut after every 2 nodes.
-        Part k: nodes {2k, 2k+1}, 1 edge → weight = edge_weight[2k].
-        Edges: 0:a, 1:b, 2:a, 3:b, ... Part k has edge 2k → weight a.
-        Not a+b.
-
-        Correct approach: P_{3m+1}, edges [a, a, b, a, a, b, ...], q=m.
-        Cut at edge indices 2, 5, 8, ... → m parts of 3 nodes (2 edges) each.
-        Each part has edges [a, a] or [a, b] depending on alignment.
-
-        Simplest: path with uniform edge weight w=a, q divides n.
-        Tested above. Instead test non-uniform with brute force.
-        """
+        """P_{2m+1} with alternating edge weights [a, b, a, b, ...], q=m:
+        non-uniform edge weights checked against the brute-force oracle."""
         n = 2 * m + 1
         G = nx.path_graph(n)
         for i, (u, v) in enumerate(sorted(G.edges)):
@@ -1905,12 +1847,7 @@ class TestVertexCountAnalytic:
     )
     def test_caterpillar_vertex_count_perfect(self, spine, leaves_per_node):
         """Caterpillar q=spine: each component = spine_node + leaves = lp+1."""
-        G = nx.path_graph(spine)
-        next_node = spine
-        for v in range(spine):
-            for _ in range(leaves_per_node):
-                G.add_edge(v, next_node)
-                next_node += 1
+        G = _caterpillar(spine, leaves_per_node)
         expected = leaves_per_node + 1
 
         p_mm = _minmax(G, spine, weight_function="vertex_count")
