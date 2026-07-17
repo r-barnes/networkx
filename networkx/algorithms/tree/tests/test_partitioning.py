@@ -26,7 +26,7 @@ from itertools import combinations
 import pytest
 
 import networkx as nx
-from networkx.algorithms.tree.partitioning import (
+from networkx.algorithms.tree.minmax_partitioning import (
     _resolve_weight_function,
     _WeightSpec,
     max_min_tree_partition,

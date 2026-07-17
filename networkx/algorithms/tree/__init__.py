@@ -5,4 +5,4 @@ from .mst import *
 from .recognition import *
 from .operations import *
 from .decomposition import *
-from .partitioning import *
+from .minmax_partitioning import *
