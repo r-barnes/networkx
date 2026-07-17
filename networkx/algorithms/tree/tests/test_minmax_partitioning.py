@@ -1,5 +1,5 @@
 """
-Tests for tree partitioning algorithms.
+Tests for min-max and max-min tree partitioning algorithms.
 
 Covers:
 - Analytical cases: path graphs, star graphs, balanced binary trees, caterpillar trees,
