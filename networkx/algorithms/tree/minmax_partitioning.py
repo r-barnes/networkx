@@ -52,6 +52,7 @@ import networkx as nx
 __all__ = [
     "min_max_tree_partition",
     "max_min_tree_partition",
+    "tree_partition_weights",
 ]
 
 
@@ -90,11 +91,11 @@ class _WeightSpec(NamedTuple):
 # partition, and single-vertex components weigh 0);
 # "mixed_sum" reads both; "vertex_count" reads neither and counts 1 per
 # node.  Adding a built-in weight function means adding an entry here.
-_WEIGHT_FUNCTIONS = {
-    "vertex_weight_sum": lambda nw, ew: _WeightSpec(nw, 1, None),
-    "edge_weight_sum": lambda nw, ew: _WeightSpec(None, 0, ew),
+_WEIGHT_FUNCTIONS: dict[str, Callable[[str, str], _WeightSpec]] = {
+    "vertex_weight_sum": lambda nw, _: _WeightSpec(nw, 1, None),
+    "edge_weight_sum": lambda _, ew: _WeightSpec(None, 0, ew),
     "mixed_sum": lambda nw, ew: _WeightSpec(nw, 1, ew),
-    "vertex_count": lambda nw, ew: _WeightSpec(None, 1, None),
+    "vertex_count": lambda _1, _2: _WeightSpec(None, 1, None),
 }
 
 
@@ -434,7 +435,7 @@ def _trivial_partition(
     q: int,
     node_w: dict[Hashable, int | float],
     edge_w: dict[tuple[Hashable, Hashable], int | float],
-) -> list[tuple[frozenset, int | float]] | None:
+) -> list[tuple[frozenset[Hashable], int | float]] | None:
     """The q == 1 (whole tree) and q == n (all singletons) partitions,
     common to both solvers; None when 1 < q < n."""
     verts = list(T)
@@ -475,7 +476,7 @@ def _reduce_to_q_parts(
     q: int,
     node_w: dict[Hashable, int | float],
     edge_w: dict[tuple[Hashable, Hashable], int | float],
-) -> list[tuple[frozenset, int | float]]:
+) -> list[tuple[frozenset[Hashable], int | float]]:
     """Reduce parts to exactly q for max-min by merging the lightest component
     with a neighbor, returning the final partition as (nodes, weight) pairs.
 
@@ -654,7 +655,7 @@ def _binary_search_minmax(
     node_w: dict[Hashable, int | float],
     edge_w: dict[tuple[Hashable, Hashable], int | float],
     integral: bool,
-) -> list[tuple[frozenset, int | float]]:
+) -> list[tuple[frozenset[Hashable], int | float]]:
     """Min-max q-partition via exact grid bisection + greedy oracle.
 
     Bisects the grid of representable threshold values (see
@@ -713,7 +714,7 @@ def _binary_search_maxmin(
     node_w: dict[Hashable, int | float],
     edge_w: dict[tuple[Hashable, Hashable], int | float],
     integral: bool,
-) -> list[tuple[frozenset, int | float]]:
+) -> list[tuple[frozenset[Hashable], int | float]]:
     """Max-min q-partition via exact grid bisection + greedy oracle.
 
     Mirror image of `_binary_search_minmax`, sharing `_bisect_threshold`:
@@ -765,8 +766,8 @@ def _binary_search_maxmin(
 
 
 def _sorted_components(
-    partition: list[tuple[frozenset, float]], descending: bool
-) -> list[frozenset]:
+    partition: list[tuple[frozenset[Hashable], float]], descending: bool
+) -> list[frozenset[Hashable]]:
     """Sort (nodes, weight) pairs by weight and return just the node sets."""
     ordered = sorted(partition, key=lambda x: x[1], reverse=descending)
     return [nodes for nodes, _ in ordered]
@@ -802,7 +803,7 @@ def _tree_partition(
     weight_function: str,
     solver,
     descending: bool,
-) -> list[frozenset]:
+) -> list[frozenset[Hashable]]:
     """Shared driver behind both public entry points: resolve and validate,
     build weight maps, pick the bisection grid, solve, and sort."""
     spec = _resolve_weight_function(weight_function, node_weight, edge_weight)
@@ -842,7 +843,7 @@ def min_max_tree_partition(
     edge_weight: str = "weight",
     *,
     weight_function: str = "vertex_weight_sum",
-) -> list[frozenset]:
+) -> list[frozenset[Hashable]]:
     r"""Partition a weighted tree into ``q`` components minimizing the maximum
     component weight.
 
@@ -993,7 +994,7 @@ def max_min_tree_partition(
     edge_weight: str = "weight",
     *,
     weight_function: str = "vertex_weight_sum",
-) -> list[frozenset]:
+) -> list[frozenset[Hashable]]:
     r"""Partition a weighted tree into ``q`` components maximizing the minimum
     component weight.
 
@@ -1133,3 +1134,82 @@ def max_min_tree_partition(
         _binary_search_maxmin,
         descending=False,
     )
+
+
+@nx.utils.not_implemented_for("directed")
+@nx.utils.not_implemented_for("multigraph")
+@nx._dispatchable(
+    graphs="T", node_attrs={"node_weight": 1}, edge_attrs={"edge_weight": 1}
+)
+def tree_partition_weights(
+    T: nx.Graph,
+    partition: list[frozenset[Hashable]],
+    node_weight: str = "weight",
+    edge_weight: str = "weight",
+    *,
+    weight_function: str = "vertex_weight_sum",
+) -> list[int | float]:
+    r"""Return the weight of each component in a tree partition.
+
+    Given a partition produced by :func:`min_max_tree_partition` or
+    :func:`max_min_tree_partition`, return the component weight for each
+    part under the same weight function.
+
+    Parameters
+    ----------
+    T : NetworkX Graph
+        An undirected tree (connected acyclic graph).
+
+    partition : list of frozenset
+        A list of frozensets of node labels, as returned by
+        :func:`min_max_tree_partition` or :func:`max_min_tree_partition`.
+
+    node_weight : str, optional (default ``"weight"``)
+        Node attribute key read by ``"vertex_weight_sum"`` and
+        ``"mixed_sum"``.  Nodes missing the attribute are assigned weight 1.
+
+    edge_weight : str, optional (default ``"weight"``)
+        Edge attribute key read by ``"edge_weight_sum"`` and ``"mixed_sum"``.
+        Edges missing the attribute are assigned weight 1.
+
+    weight_function : str, optional (default ``"vertex_weight_sum"``)
+        How component weight is defined.  Must match the ``weight_function``
+        used to produce *partition*.  One of ``"vertex_weight_sum"``,
+        ``"edge_weight_sum"``, ``"mixed_sum"``, or ``"vertex_count"``.
+
+    Returns
+    -------
+    weights : list of int or float
+        Component weights in the same order as *partition*.
+
+    Raises
+    ------
+    NetworkXNotImplemented
+        If ``T`` is directed or a multigraph.
+
+    NetworkXError
+        If ``weight_function`` is unrecognised, ``node_weight`` or
+        ``edge_weight`` is not a string, or a node or edge weight is
+        invalid for the selected weight function.
+
+    See Also
+    --------
+    min_max_tree_partition
+    max_min_tree_partition
+
+    Examples
+    --------
+    >>> G = nx.path_graph(6)
+    >>> parts = nx.tree.min_max_tree_partition(G, 3)
+    >>> nx.tree.tree_partition_weights(G, parts)
+    [2, 2, 2]
+    """
+    spec = _resolve_weight_function(weight_function, node_weight, edge_weight)
+    if spec.node_attr is not None:
+        for v in T.nodes:
+            _check_weight(T.nodes[v].get(spec.node_attr, 1), v, True)
+    if spec.edge_attr is not None:
+        for u, v, edata in T.edges(data=True):
+            _check_weight(edata.get(spec.edge_attr, 1), (u, v), False)
+    node_w, edge_w = _weight_maps(T, spec)
+    return [_component_weight(T, list(comp), node_w, edge_w) for comp in partition]

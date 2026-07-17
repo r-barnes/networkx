@@ -4,9 +4,11 @@ Tests for min-max and max-min tree partitioning algorithms.
 Covers:
 - Analytical cases: path graphs, star graphs, balanced binary trees, caterpillar trees,
   spider graphs, chains of stars, broom graphs, comb graphs, binomial trees, and
-  weighted paths with a single heavy node — all with closed-form optimal values.
+  weighted paths with a single heavy node. These all have closed-form optimal values,
+  so it's easy for us to check that the algorithm returns the correct value and a valid
+  partition, even for large trees.
 - Edge cases: q=1, q=n, single-node trees, two-node trees.
-- Random sampling: random labeled trees compared against the brute-force reference
+- Random sampling: random labeled trees compared against a brute-force reference
   to verify consistency of the public API for both min-max and max-min problems.
 - Bound-sanity: lower bounds on OPT_minmax (average, max-node-weight,
   bottleneck-node) and upper bounds on OPT_maxmin (average, heavy-node) bracket
@@ -21,45 +23,17 @@ from __future__ import annotations
 import math
 import random
 import warnings
+from collections.abc import Hashable
 from itertools import combinations
 
 import pytest
 
 import networkx as nx
 from networkx.algorithms.tree.minmax_partitioning import (
-    _resolve_weight_function,
-    _WeightSpec,
     max_min_tree_partition,
     min_max_tree_partition,
+    tree_partition_weights,
 )
-
-
-def _wf(name: str, node_attr: str = "weight", edge_attr: str = "weight") -> _WeightSpec:
-    """Weight-function spec by its public name."""
-    return _resolve_weight_function(name, node_attr, edge_attr)
-
-
-def _component_weight_via_wf(T: nx.Graph, comp, wf: _WeightSpec) -> float:
-    """Component weight recomputed independently of the module under test.
-
-    Reads attributes straight off the graph (missing attributes default
-    to 1, per the documented contract) so that a bug in the module's own
-    weight bookkeeping cannot cancel out in oracle comparisons.  Sums run
-    in graph iteration order, so identical components always sum in the
-    same order regardless of how *comp* is ordered.
-    """
-    comp = set(comp)
-    if wf.node_attr is None:
-        total = wf.node_const * len(comp)
-    else:
-        total = sum(T.nodes[v].get(wf.node_attr, 1) for v in T if v in comp)
-    if wf.edge_attr is not None:
-        total += sum(
-            d.get(wf.edge_attr, 1)
-            for u, v, d in T.edges(data=True)
-            if u in comp and v in comp
-        )
-    return total
 
 
 # ---------------------------------------------------------------------------
@@ -79,8 +53,10 @@ def _attach_weights(
     edge_weight: str,
     weight_function: str,
 ) -> list[tuple[frozenset, float]]:
-    wf = _resolve_weight_function(weight_function, node_weight, edge_weight)
-    return [(nodes, _component_weight_via_wf(T, nodes, wf)) for nodes in parts]
+    weights = tree_partition_weights(
+        T, parts, node_weight, edge_weight, weight_function=weight_function
+    )
+    return list(zip(parts, weights))
 
 
 def _minmax(
@@ -127,8 +103,11 @@ def _maxmin(
 def _brute_force_partition(
     T: nx.Graph,
     q: int,
-    wf: _WeightSpec,
     maximize_min: bool,
+    *,
+    weight_function: str = "vertex_weight_sum",
+    node_weight: str = "weight",
+    edge_weight: str = "weight",
 ) -> list[tuple[frozenset, float]]:
     """Brute-force optimal tree partition by exhaustive edge-cut enumeration.
 
@@ -137,15 +116,16 @@ def _brute_force_partition(
     maximizes the minimum component weight (``maximize_min=True``).  Used
     here as an independent oracle for cross-checking the binary-search
     solvers on small inputs (n <= 12); O(C(n-1, q-1)) — do not use in
-    production.  Deliberately built from networkx primitives and the
-    independent weight recompute above, not the module under test's
-    helpers, so shared bugs cannot cancel out.
+    production.
     """
     k = q - 1
     edges = list(T.edges())
 
     if k == 0:
-        return [(frozenset(T.nodes()), _component_weight_via_wf(T, T.nodes(), wf))]
+        [w] = tree_partition_weights(
+            T, [frozenset(T.nodes())], node_weight, edge_weight, weight_function=weight_function
+        )
+        return [(frozenset(T.nodes()), w)]
 
     best_val = float("inf") if not maximize_min else float("-inf")
     best_partition = []
@@ -155,7 +135,15 @@ def _brute_force_partition(
         comps = list(nx.connected_components(nx.restricted_view(T, [], cut)))
         if len(comps) != q:
             continue
-        labeled = [(frozenset(c), _component_weight_via_wf(T, c, wf)) for c in comps]
+        labeled = [
+            (
+                frozenset(c),
+                tree_partition_weights(
+                    T, [frozenset(c)], node_weight, edge_weight, weight_function=weight_function
+                )[0],
+            )
+            for c in comps
+        ]
         val = (
             max(w for _, w in labeled)
             if not maximize_min
@@ -192,8 +180,10 @@ def _is_valid_partition(
     T: nx.Graph,
     partition: list[tuple[frozenset, float]],
     q: int,
-    weight: str = "weight",
-    wf: _WeightSpec | None = None,
+    *,
+    weight_function: str = "vertex_weight_sum",
+    node_weight: str = "weight",
+    edge_weight: str = "weight",
 ) -> bool:
     """Return True iff partition is a valid q-partition of T.
 
@@ -214,10 +204,9 @@ def _is_valid_partition(
         sub = T.subgraph(nodes)
         if not nx.is_connected(sub):
             return False
-        if wf is not None:
-            expected_w = _component_weight_via_wf(T, list(nodes), wf)
-        else:
-            expected_w = sum(T.nodes[v].get(weight, 1) for v in nodes)
+        [expected_w] = tree_partition_weights(
+            T, [nodes], node_weight, edge_weight, weight_function=weight_function
+        )
         if not math.isclose(reported_w, expected_w):
             return False
     return seen == all_nodes
@@ -707,21 +696,21 @@ class TestPathGraphs:
         G = nx.path_graph(4)
         nx.set_node_attributes(G, {0: 3, 1: 1, 2: 1, 3: 3}, "weight")
         p = _minmax(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p, 2, weight="weight")
+        assert _is_valid_partition(G, p, 2)
         assert _max_weight(p) == 4
 
     def test_path_weighted_max_min(self):
         G = nx.path_graph(4)
         nx.set_node_attributes(G, {0: 1, 1: 5, 2: 5, 3: 1}, "weight")
         p = _maxmin(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p, 2, weight="weight")
+        assert _is_valid_partition(G, p, 2)
         assert _min_weight(p) == 6
 
     def test_path_weighted_asymmetric(self):
         G = nx.path_graph(5)
         nx.set_node_attributes(G, {0: 1, 1: 1, 2: 10, 3: 1, 4: 1}, "weight")
         p = _minmax(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p, 2, weight="weight")
+        assert _is_valid_partition(G, p, 2)
         assert _max_weight(p) == 12
 
 
@@ -754,11 +743,11 @@ class TestStarGraphs:
         G = nx.star_graph(3)
         nx.set_node_attributes(G, {0: 10, 1: 1, 2: 1, 3: 1}, "weight")
         p_mm = _minmax(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p_mm, 2, weight="weight")
+        assert _is_valid_partition(G, p_mm, 2)
         assert _max_weight(p_mm) == 12
 
         p_mx = _maxmin(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p_mx, 2, weight="weight")
+        assert _is_valid_partition(G, p_mx, 2)
         assert _min_weight(p_mx) == 1
 
 
@@ -866,36 +855,36 @@ class TestExplicitWeightedTrees:
         G = nx.Graph([(0, 1), (0, 2), (0, 3)])
         nx.set_node_attributes(G, {0: 4, 1: 2, 2: 2, 3: 2}, "weight")
         p_mm = _minmax(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p_mm, 2, weight="weight")
+        assert _is_valid_partition(G, p_mm, 2)
         assert _max_weight(p_mm) == 8
 
         p_mx = _maxmin(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p_mx, 2, weight="weight")
+        assert _is_valid_partition(G, p_mx, 2)
         assert _min_weight(p_mx) == 2
 
     def test_unequal_arms_y_tree_q3(self):
         G = nx.Graph([(0, 1), (0, 2), (0, 3)])
         nx.set_node_attributes(G, {0: 1, 1: 2, 2: 3, 3: 6}, "weight")
         p_mm = _minmax(G, 3, node_weight="weight")
-        assert _is_valid_partition(G, p_mm, 3, weight="weight")
+        assert _is_valid_partition(G, p_mm, 3)
         assert _max_weight(p_mm) == 6
 
         p_mx = _maxmin(G, 3, node_weight="weight")
-        assert _is_valid_partition(G, p_mx, 3, weight="weight")
+        assert _is_valid_partition(G, p_mx, 3)
         assert _min_weight(p_mx) == 3
 
     def test_missing_weight_attribute_defaults_to_1(self):
         G = nx.path_graph(4)
         nx.set_node_attributes(G, {0: 3, 2: 3}, "weight")
         p = _minmax(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p, 2, weight="weight")
+        assert _is_valid_partition(G, p, 2)
         assert _max_weight(p) == 4
 
     def test_custom_weight_attribute_name(self):
         G = nx.path_graph(4)
         nx.set_node_attributes(G, {0: 1, 1: 1, 2: 1, 3: 1}, "cost")
         p = _minmax(G, 2, node_weight="cost")
-        assert _is_valid_partition(G, p, 2, weight="cost")
+        assert _is_valid_partition(G, p, 2, node_weight="cost")
         assert _max_weight(p) == 2
 
 
@@ -955,11 +944,10 @@ class TestRandomSampling:
             T.nodes[v]["weight"] = rng.randint(1, 10)
         q = rng.randint(1, min(n, 4))
 
-        wf = _wf("vertex_weight_sum")
         p_public = _minmax(T, q, node_weight="weight")
-        p_ref = _brute_force_partition(T, q, wf, maximize_min=False)
+        p_ref = _brute_force_partition(T, q, False)
 
-        assert _is_valid_partition(T, p_public, q, weight="weight")
+        assert _is_valid_partition(T, p_public, q)
         assert _is_sorted_descending(p_public)
         assert _max_weight(p_public) == _max_weight(p_ref)
 
@@ -972,11 +960,10 @@ class TestRandomSampling:
             T.nodes[v]["weight"] = rng.randint(1, 10)
         q = rng.randint(1, min(n, 4))
 
-        wf = _wf("vertex_weight_sum")
         p_public = _maxmin(T, q, node_weight="weight")
-        p_ref = _brute_force_partition(T, q, wf, maximize_min=True)
+        p_ref = _brute_force_partition(T, q, True)
 
-        assert _is_valid_partition(T, p_public, q, weight="weight")
+        assert _is_valid_partition(T, p_public, q)
         assert _is_sorted_ascending(p_public)
         assert _min_weight(p_public) == _min_weight(p_ref)
 
@@ -1011,11 +998,10 @@ class TestFloatWeightsVsBruteForce:
             T.nodes[v]["weight"] = round(rng.uniform(0.5, 5.0), 2)
         q = rng.randint(1, min(n, 4))
 
-        wf = _wf("vertex_weight_sum")
         p_default = _minmax(T, q, node_weight="weight")
-        p_brute = _brute_force_partition(T, q, wf, maximize_min=False)
+        p_brute = _brute_force_partition(T, q, False)
 
-        assert _is_valid_partition(T, p_default, q, weight="weight")
+        assert _is_valid_partition(T, p_default, q)
         assert math.isclose(_max_weight(p_default), _max_weight(p_brute), rel_tol=1e-9)
 
     @pytest.mark.parametrize("seed", [0, 1, 5, 9, 17])
@@ -1027,11 +1013,10 @@ class TestFloatWeightsVsBruteForce:
             T.nodes[v]["weight"] = round(rng.uniform(0.5, 5.0), 2)
         q = rng.randint(1, min(n, 4))
 
-        wf = _wf("vertex_weight_sum")
         p_default = _maxmin(T, q, node_weight="weight")
-        p_brute = _brute_force_partition(T, q, wf, maximize_min=True)
+        p_brute = _brute_force_partition(T, q, True)
 
-        assert _is_valid_partition(T, p_default, q, weight="weight")
+        assert _is_valid_partition(T, p_default, q)
         assert math.isclose(_min_weight(p_default), _min_weight(p_brute), rel_tol=1e-9)
 
 
@@ -1166,11 +1151,11 @@ class TestLargeAnalytical:
         expected = a + b
 
         p_mm = _minmax(G, m, node_weight="weight")
-        assert _is_valid_partition(G, p_mm, m, weight="weight")
+        assert _is_valid_partition(G, p_mm, m)
         assert _max_weight(p_mm) == expected
 
         p_mx = _maxmin(G, m, node_weight="weight")
-        assert _is_valid_partition(G, p_mx, m, weight="weight")
+        assert _is_valid_partition(G, p_mx, m)
         assert _min_weight(p_mx) == expected
 
     def test_extreme_weight_ratio_minmax_exact(self):
@@ -1180,14 +1165,14 @@ class TestLargeAnalytical:
         G = nx.path_graph(4)
         nx.set_node_attributes(G, {0: 10**12, 1: 3, 2: 3, 3: 10**12}, "weight")
         p = _minmax(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p, 2, weight="weight")
+        assert _is_valid_partition(G, p, 2)
         assert _max_weight(p) == 10**12 + 3
 
     def test_extreme_weight_ratio_maxmin_exact(self):
         G = nx.path_graph(3)
         nx.set_node_attributes(G, {0: 10**10, 1: 1, 2: 1}, "weight")
         p = _maxmin(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, p, 2, weight="weight")
+        assert _is_valid_partition(G, p, 2)
         assert _min_weight(p) == 2
 
     def test_extreme_weight_ratio_float_maxmin_exact(self):
@@ -1440,11 +1425,11 @@ class TestBoundSanity:
         nx.set_node_attributes(G, {v: (H if v == p else 1) for v in G.nodes}, "weight")
 
         pm = _minmax(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, pm, 2, weight="weight")
+        assert _is_valid_partition(G, pm, 2)
         assert _max_weight(pm) == H + (n - 1 - p)
 
         px = _maxmin(G, 2, node_weight="weight")
-        assert _is_valid_partition(G, px, 2, weight="weight")
+        assert _is_valid_partition(G, px, 2)
         assert _min_weight(px) == p
 
     @pytest.mark.parametrize(
@@ -1554,14 +1539,13 @@ class TestPriorBugCase:
         for u, v in [(0, 1), (1, 2), (1, 3), (1, 4), (1, 5), (4, 6), (3, 7)]:
             G.add_edge(u, v)
 
-        wf = _wf("vertex_weight_sum")
         expected = 7.941585707193345
         p = _minmax(G, 5, node_weight="weight")
-        assert _is_valid_partition(G, p, 5, weight="weight")
+        assert _is_valid_partition(G, p, 5)
         assert math.isclose(_max_weight(p), expected, rel_tol=1e-6)
 
         # Verify against brute force
-        p_bf = _brute_force_partition(G, 5, wf, maximize_min=False)
+        p_bf = _brute_force_partition(G, 5, False)
         assert math.isclose(_max_weight(p), _max_weight(p_bf), rel_tol=1e-6)
 
 
@@ -1585,10 +1569,10 @@ class TestWeightFunctionRandomized:
     generalized brute force on small random trees."""
 
     ADDITIVE_WFS = [
-        ("vertex_weight_sum", lambda: _wf("vertex_weight_sum"), "vsum"),
-        ("edge_weight_sum", lambda: _wf("edge_weight_sum"), "esum"),
-        ("mixed_sum", lambda: _wf("mixed_sum"), "mixed"),
-        ("vertex_count", lambda: _wf("vertex_count"), "count"),
+        ("vertex_weight_sum", "vsum"),
+        ("edge_weight_sum", "esum"),
+        ("mixed_sum", "mixed"),
+        ("vertex_count", "count"),
     ]
 
     @pytest.mark.parametrize("seed", [0, 1, 7, 13, 42, 99, 123, 200])
@@ -1599,12 +1583,11 @@ class TestWeightFunctionRandomized:
             q = rng.randint(2, min(n, 5))
             T = _random_tree_with_weights(n, rng)
 
-            for wf_name, wf_factory, label in self.ADDITIVE_WFS:
-                wf = wf_factory()
+            for wf_name, label in self.ADDITIVE_WFS:
                 p_algo = _minmax(T, q, weight_function=wf_name)
-                p_bf = _brute_force_partition(T, q, wf, maximize_min=False)
+                p_bf = _brute_force_partition(T, q, False, weight_function=wf_name)
 
-                assert _is_valid_partition(T, p_algo, q, wf=wf), (
+                assert _is_valid_partition(T, p_algo, q, weight_function=wf_name), (
                     f"Invalid partition: seed={seed} trial={trial} n={n} q={q} wf={label}"
                 )
                 assert math.isclose(
@@ -1622,12 +1605,11 @@ class TestWeightFunctionRandomized:
             q = rng.randint(2, min(n, 5))
             T = _random_tree_with_weights(n, rng)
 
-            for wf_name, wf_factory, label in self.ADDITIVE_WFS:
-                wf = wf_factory()
+            for wf_name, label in self.ADDITIVE_WFS:
                 p_algo = _maxmin(T, q, weight_function=wf_name)
-                p_bf = _brute_force_partition(T, q, wf, maximize_min=True)
+                p_bf = _brute_force_partition(T, q, True, weight_function=wf_name)
 
-                assert _is_valid_partition(T, p_algo, q, wf=wf), (
+                assert _is_valid_partition(T, p_algo, q, weight_function=wf_name), (
                     f"Invalid partition: seed={seed} trial={trial} n={n} q={q} wf={label}"
                 )
                 assert math.isclose(
@@ -1656,12 +1638,7 @@ class TestComponentConsistencyMultiWF:
             q = rng.randint(2, min(n, 10))
             T = _random_tree_with_weights(n, rng)
 
-            for wf_name, wf in [
-                ("vertex_weight_sum", _wf("vertex_weight_sum")),
-                ("edge_weight_sum", _wf("edge_weight_sum")),
-                ("mixed_sum", _wf("mixed_sum")),
-                ("vertex_count", _wf("vertex_count")),
-            ]:
+            for wf_name in ["vertex_weight_sum", "edge_weight_sum", "mixed_sum", "vertex_count"]:
                 for fn in [_minmax, _maxmin]:
                     p = fn(T, q, weight_function=wf_name)
                     assert len(p) == q, f"expected {q} comps, got {len(p)}"
@@ -1672,7 +1649,9 @@ class TestComponentConsistencyMultiWF:
                     assert all_verts == set(T.nodes), "missing or extra vertices"
 
                     for nodes, reported_w in p:
-                        computed_w = _component_weight_via_wf(T, list(nodes), wf)
+                        [computed_w] = tree_partition_weights(
+                            T, [frozenset(nodes)], weight_function=wf_name
+                        )
                         assert math.isclose(reported_w, computed_w, rel_tol=1e-9), (
                             f"reported {reported_w} != computed {computed_w}"
                         )
@@ -1717,11 +1696,11 @@ class TestEdgeWeightSumAnalytic:
         expected = (n // q - 1) * w
 
         p_mm = _minmax(G, q, weight_function="edge_weight_sum")
-        assert _is_valid_partition(G, p_mm, q, wf=_wf("edge_weight_sum"))
+        assert _is_valid_partition(G, p_mm, q, weight_function="edge_weight_sum")
         assert math.isclose(_max_weight(p_mm), expected)
 
         p_mx = _maxmin(G, q, weight_function="edge_weight_sum")
-        assert _is_valid_partition(G, p_mx, q, wf=_wf("edge_weight_sum"))
+        assert _is_valid_partition(G, p_mx, q, weight_function="edge_weight_sum")
         assert math.isclose(_min_weight(p_mx), expected)
 
     @pytest.mark.parametrize("n", [3, 5, 8])
@@ -1771,13 +1750,12 @@ class TestEdgeWeightSumAnalytic:
         for i, (u, v) in enumerate(sorted(G.edges)):
             G.edges[u, v]["weight"] = a if i % 2 == 0 else b
 
-        wf = _wf("edge_weight_sum")
         p_mm = _minmax(G, m, weight_function="edge_weight_sum")
-        p_bf = _brute_force_partition(G, m, wf, maximize_min=False)
+        p_bf = _brute_force_partition(G, m, False, weight_function="edge_weight_sum")
         assert math.isclose(_max_weight(p_mm), _max_weight(p_bf), rel_tol=1e-6)
 
         p_mx = _maxmin(G, m, weight_function="edge_weight_sum")
-        p_bf2 = _brute_force_partition(G, m, wf, maximize_min=True)
+        p_bf2 = _brute_force_partition(G, m, True, weight_function="edge_weight_sum")
         assert math.isclose(_min_weight(p_mx), _min_weight(p_bf2), rel_tol=1e-6)
 
     @pytest.mark.parametrize(
@@ -1886,11 +1864,11 @@ class TestMixedSumAnalytic:
         expected = 2 * piece - 1
 
         p_mm = _minmax(G, q, weight_function="mixed_sum")
-        assert _is_valid_partition(G, p_mm, q, wf=_wf("mixed_sum"))
+        assert _is_valid_partition(G, p_mm, q, weight_function="mixed_sum")
         assert math.isclose(_max_weight(p_mm), expected)
 
         p_mx = _maxmin(G, q, weight_function="mixed_sum")
-        assert _is_valid_partition(G, p_mx, q, wf=_wf("mixed_sum"))
+        assert _is_valid_partition(G, p_mx, q, weight_function="mixed_sum")
         assert math.isclose(_min_weight(p_mx), expected)
 
     @pytest.mark.parametrize("n", [3, 5, 8])
@@ -1978,12 +1956,12 @@ class TestReviewRegressions:
         p_mm = _minmax(G, q, weight_function="edge_weight_sum")
         assert len(p_mm) == q
         assert all(w == 0.0 for _, w in p_mm)
-        assert _is_valid_partition(G, p_mm, q, wf=_wf("edge_weight_sum"))
+        assert _is_valid_partition(G, p_mm, q, weight_function="edge_weight_sum")
 
         p_mx = _maxmin(G, q, weight_function="edge_weight_sum")
         assert len(p_mx) == q
         assert all(w == 0.0 for _, w in p_mx)
-        assert _is_valid_partition(G, p_mx, q, wf=_wf("edge_weight_sum"))
+        assert _is_valid_partition(G, p_mx, q, weight_function="edge_weight_sum")
 
     # Deterministic tiebreaker in _reduce_cuts_to_reach_q: same input must
     # always yield the same output.  Pre-fix, id(cut) varied across runs.
@@ -2018,7 +1996,9 @@ class TestReviewRegressions:
         p = _minmax(G, 3, edge_weight="cost", weight_function="edge_weight_sum")
         # 6 nodes in 3 parts of 2 nodes each → 1 edge per part → weight = 2.0
         assert math.isclose(_max_weight(p), 2.0)
-        assert _is_valid_partition(G, p, 3, wf=_wf("edge_weight_sum", edge_attr="cost"))
+        assert _is_valid_partition(
+            G, p, 3, weight_function="edge_weight_sum", edge_weight="cost"
+        )
 
     def test_mixed_sum_distinct_node_and_edge_attrs(self):
         """mixed_sum with separately-named node and edge attributes — newly
@@ -2037,7 +2017,7 @@ class TestReviewRegressions:
         # 2 nodes (2 * 3 = 6) + 1 edge (1) = 7 per component
         assert math.isclose(_max_weight(p), 7.0)
         assert _is_valid_partition(
-            G, p, 3, wf=_wf("mixed_sum", node_attr="size", edge_attr="len")
+            G, p, 3, weight_function="mixed_sum", node_weight="size", edge_weight="len"
         )
 
 
@@ -2135,14 +2115,13 @@ class TestMissingEdgeAttrDefault:
             if rng.random() < 0.5:
                 T.edges[u, v]["weight"] = rng.randint(1, 9)
         q = rng.randint(2, 5)
-        wf = _wf(weight_function)
 
         p_mm = _minmax(T, q, weight_function=weight_function)
-        bf_mm = _brute_force_partition(T, q, wf, maximize_min=False)
-        assert _is_valid_partition(T, p_mm, q, wf=wf)
+        bf_mm = _brute_force_partition(T, q, False, weight_function=weight_function)
+        assert _is_valid_partition(T, p_mm, q, weight_function=weight_function)
         assert _max_weight(p_mm) == _max_weight(bf_mm)
 
         p_mx = _maxmin(T, q, weight_function=weight_function)
-        bf_mx = _brute_force_partition(T, q, wf, maximize_min=True)
-        assert _is_valid_partition(T, p_mx, q, wf=wf)
+        bf_mx = _brute_force_partition(T, q, True, weight_function=weight_function)
+        assert _is_valid_partition(T, p_mx, q, weight_function=weight_function)
         assert _min_weight(p_mx) == _min_weight(bf_mx)
