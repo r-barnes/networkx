@@ -83,7 +83,7 @@ Decomposition
 
 Partitioning
 ------------
-.. automodule:: networkx.algorithms.tree.partitioning
+.. automodule:: networkx.algorithms.tree.minmax_partitioning
 .. autosummary::
    :toctree: generated/
 
