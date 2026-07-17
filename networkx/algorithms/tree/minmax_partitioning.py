@@ -1,8 +1,13 @@
 """
-Algorithms for partitioning weighted trees into connected components.
+Min-max and max-min tree partitioning algorithms.
 
-Supports MIN-MAX and MAX-MIN objectives over four built-in additive weight
-functions, selected via the ``weight_function`` keyword:
+Implements ``min_max_tree_partition`` (Kundu-Misra 1977) and
+``max_min_tree_partition`` (Perl-Schach 1981): given a weighted tree and an
+integer q, partition it into exactly q connected subtrees minimizing the
+heaviest component (min-max) or maximizing the lightest component (max-min).
+
+Both algorithms support the same four built-in additive weight functions,
+selected via the ``weight_function`` keyword:
 ``"vertex_weight_sum"``, ``"edge_weight_sum"``, ``"mixed_sum"``, and
 ``"vertex_count"``.
 
