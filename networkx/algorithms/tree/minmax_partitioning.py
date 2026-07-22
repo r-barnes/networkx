@@ -46,7 +46,8 @@ import math
 import numbers
 import struct
 from collections.abc import Callable, Hashable
-from typing import Any, NamedTuple
+from dataclasses import dataclass
+from typing import Any
 
 import networkx as nx
 
@@ -62,7 +63,8 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-class _WeightSpec(NamedTuple):
+@dataclass(frozen=True)
+class _WeightSpec:
     """Additive weight specification: where node and edge weights come from.
 
     Component weight is the sum of per-node and per-edge weights.
